@@ -535,7 +535,7 @@ class Model:
         x_causal_mask = q_pos[:, None] // h.block_size >= k_pos[None, :]
         x_causal_mask = x_causal_mask[jnp.newaxis, ..., jnp.newaxis, jnp.newaxis]
 
-        rope_table = RopeTable.create(L, h)
+        rope_table = RopeTable.create(L, h, pos_mult=h.block_size)
         concept_rope_table = RopeTable.create(n_blocks, h)
 
         # Encoder block
@@ -815,6 +815,7 @@ class Model:
                     "B/d L M, M Q K/t D -> B/d L Q K/t D", nx, x_w_q
                 )
             )
+            q = rope_table.apply("L D -> 1 L 1 1 D", q)
 
             x_w_kv = shardops.all_gather(
                 "2 M/d K/t D -> 2 M K/t D", jnp.bfloat16(x_w_kv)
@@ -822,6 +823,7 @@ class Model:
             k, v = hidden_mult * shardops.einsum_unreduced(
                 "B/d n_blocks M, k_v M K/t D -> k_v B/d n_blocks K/t D", nz, x_w_kv
             )
+            k = concept_rope_table.apply("n_blocks d -> 1 n_blocks 1 d", k)
             k = save_for_backward(k)
             v = save_for_backward(v)
 
@@ -831,6 +833,8 @@ class Model:
                 k,
                 preferred_element_type=jnp.float32,
             )
+            logits = jnp.where(x_causal_mask, logits, -1e10)
+
             # need a mask of size L x n_blocks
             probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
             attn_out = shardops.einsum_unreduced(
@@ -1077,7 +1081,7 @@ class RopeTable:
     cos: f32["len d_head2"]
 
     @staticmethod
-    def create(max_len: int, hparams: Hparams) -> "RopeTable":
+    def create(max_len: int, hparams: Hparams, pos_scale: int = 1) -> "RopeTable":
         rope_max_timescale = hparams.rope_max_timescale
         d_head = hparams.d_head
         d = d_head // 2
@@ -1085,7 +1089,7 @@ class RopeTable:
         timescale = jnp.logspace(
             0, jnp.log10(jnp.float32(rope_max_timescale)), d, endpoint=False
         )
-        position = jnp.arange(max_len, dtype=jnp.int32)
+        position = jnp.arange(max_len, dtype=jnp.int32) // pos_scale
         sinusoid_inp = jnp.float32(position[:, jnp.newaxis]) / timescale[jnp.newaxis, :]
         sin = jnp.sin(sinusoid_inp)
         cos = jnp.cos(sinusoid_inp)

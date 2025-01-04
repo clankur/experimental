@@ -280,9 +280,9 @@ class Model:
     x_lnx: f32["n_t_layers d_model/t/d"]
     x_lnz: f32["n_t_layers d_model/t/d"]
 
-    w_mix: f32["block_size/t/d 1"]  # Separate tensor for weighted sum reduction
+    w_mix: f32["block_size 1"]  # Separate tensor for weighted sum reduction
     w_reduce_q: f32["1 d_model/t/d"]  # Modified shape for direct query tensor
-    w_reduce_kv: f32["2 block_size/t/d block_size"]
+    w_reduce_kv: f32["2 block_size block_size"]
 
     @staticmethod
     @typechecked
@@ -897,29 +897,24 @@ class Model:
         if h.reduction_strategy == "sum":
             x = einops.reduce(x, "B n_blocks block_size M -> B n_blocks M", "sum")
         elif h.reduction_strategy == "max":
-            x = einops.reduce(x, "B (n_blocks block_size) M -> B n_blocks M", "max")
+            x = einops.reduce(x, "B n_blocks block_size M -> B n_blocks M", "max")
         elif h.reduction_strategy == "wei_sum":
-            w_mix = shardops.all_gather("block_size/t/d 1 -> block_size 1", self.w_mix)
             x = shardops.einsum_unreduced(
                 "B/d n_blocks block_size M/t, block_size 1 -> B/d n_blocks M/t",
                 x,
-                w_mix,
+                self.w_mix,
             )
         elif h.reduction_strategy == "attn":
             w_reduce_q = shardops.all_gather("1 M/t/d -> 1 M/t", self.w_reduce_q)
-            w_reduce_kv = shardops.all_gather(
-                "2 block_size/t/d block_size -> 2 block_size block_size",
-                jnp.bfloat16(self.w_reduce_kv),
-            )
 
             reduce_k, reduce_v = hidden_mult * shardops.einsum_unreduced(
                 "B/d n_blocks block_size M/t, k_v block_size b_size -> k_v B/d n_blocks b_size M/t",
                 x,
-                w_reduce_kv,
+                self.w_reduce_kv,
             )
-
+            print(reduce_k.shape)
             logits = shardops.einsum_unreduced(
-                "1 M/t, B/d n_blocks Kblocks M/t -> B/d n_blocks 1 Kblocks M/t",
+                "1 M/t, B/d n_blocks block_size M/t -> B/d n_blocks 1 block_size M/t",
                 w_reduce_q,
                 reduce_k,
                 preferred_element_type=jnp.float32,
@@ -928,7 +923,7 @@ class Model:
             attn_weights = jnp.bfloat16(jax.nn.softmax(logits, axis=-1))
 
             x = shardops.einsum_unreduced(
-                "B/d n_blocks 1 Kblocks M/t, B/d n_blocks Kblocks M/t -> B/d n_blocks M/t",
+                "B/d n_blocks 1 block_size M/t, B/d n_blocks block_size M/t -> B/d n_blocks M/t",
                 attn_weights,
                 reduce_v,
             )
@@ -1206,6 +1201,12 @@ def training_step(
 
         # AdamW optimizer with global gradient clipping.
         grad_leaves, grad_treedef = jax.tree_util.tree_flatten(grad)
+        grad_leaves = [
+            shardops.pmean_across_replicas(pspec, g)
+            for g, pspec in zip(
+                grad_leaves, tree_leaves(shardtypes.make_partition_specs(State))
+            )
+        ]
         global_norm_square = jnp.float32(0.0)
         for g in grad_leaves:
             assert g.dtype == jnp.float32
@@ -1279,9 +1280,6 @@ def training_step(
             tree_leaves(shardtypes.make_partition_specs(State)),
             tree_leaves(lr_scales),
         ):
-            assert shardtypes.is_fully_sharded(
-                spec
-            ), "Weight update is only correctly scaled for fully sharded weights."
             # Gradient clipping
             g = g * rescale
             # Adam scaling

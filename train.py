@@ -280,8 +280,12 @@ class Model:
     x_lnz: f32["n_t_layers d_model/t/d"]
 
     w_mix: f32["block_size 1"]  # Separate tensor for weighted sum reduction
-    w_reduce_q: f32["1 d_model/t/d"]  # Modified shape for direct query tensor
-    w_reduce_kv: f32["2 block_size block_size"]
+
+    w_reduce_q: f32[
+        "1 n_q_per_kv n_kv/t d_head/d"
+    ]  # Modified shape for direct query tensor
+    w_reduce_kv: f32["2 d_model/d n_kv/t d_head"]
+    w_reduce_o: f32["d_model/d n_q_per_kv n_kv/t d_head"]
 
     @staticmethod
     @typechecked
@@ -439,16 +443,29 @@ class Model:
         )
 
         # Initialize w_reduce_q as a learned query vector
-        w_reduce_q = jax.random.truncated_normal(
-            fold_in_str(rng, "w_reduce_q"), -2, 2, (1, h.d_model), dtype=jnp.float32
+        w_reduce_q = w_q_scale * jax.random.truncated_normal(
+            fold_in_str(rng, "w_reduce_q"),
+            -2,
+            2,
+            (1, h.n_q_per_kv, h.n_kv, h.d_head),
+            dtype=jnp.float32,
         )
 
         # Initialize reduction weights for k/v
-        w_reduce_kv = block_size_scale * jax.random.truncated_normal(
+        w_reduce_kv = w_kv_scale * jax.random.truncated_normal(
             fold_in_str(rng, "w_reduce_kv"),
             -2,
             2,
-            (2, h.block_size, h.block_size),
+            (2, h.d_model, h.n_kv, h.d_head),
+            dtype=jnp.float32,
+        )
+
+        # Initialize reduction weights for output
+        w_reduce_o = w_o_scale * jax.random.truncated_normal(
+            fold_in_str(rng, "w_reduce_o"),
+            -2,
+            2,
+            (h.d_model, h.n_q_per_kv, h.n_kv, h.d_head),
             dtype=jnp.float32,
         )
 
@@ -488,6 +505,7 @@ class Model:
             w_mix=w_mix,
             w_reduce_q=w_reduce_q,
             w_reduce_kv=w_reduce_kv,
+            w_reduce_o=w_reduce_o,
         )
         shardings = make_shardings(Model)
         return jax.tree.map(lax.with_sharding_constraint, arrays, shardings)
@@ -891,17 +909,17 @@ class Model:
                 self.e_ln2,
             ),
         )
-
-        # reduce for each chunk of block_size to a single embedding
         x = einops.rearrange(
             x,
             "B (n_blocks block_size) M -> B n_blocks block_size M",
             n_blocks=n_blocks,
         )
-        if h.reduction_strategy == "sum":
-            x = einops.reduce(x, "B n_blocks block_size M -> B n_blocks M", "sum")
-        elif h.reduction_strategy == "max":
-            x = einops.reduce(x, "B n_blocks block_size M -> B n_blocks M", "max")
+        # reduce for each chunk of block_size to a single embedding
+
+        if h.reduction_strategy == "sum" or h.reduction_strategy == "max":
+            x = einops.reduce(
+                x, "B n_blocks block_size M -> B n_blocks M", h.reduction_strategy
+            )
         elif h.reduction_strategy == "wei_sum":
             x = shardops.einsum_unreduced(
                 "B/d n_blocks block_size M/t, block_size 1 -> B/d n_blocks M/t",
@@ -909,27 +927,53 @@ class Model:
                 self.w_mix,
             )
         elif h.reduction_strategy == "attn":
-            w_reduce_q = shardops.all_gather("1 M/t/d -> 1 M/t", self.w_reduce_q)
+            x = shardops.all_gather(
+                "B/d n_blocks block_size M/t -> B/d n_blocks block_size M", x
+            )
+
+            w_reduce_q = shardops.all_gather(
+                "1 n_q_per_kv n_kv/t d_head/d -> 1 n_q_per_kv n_kv/t d_head",
+                self.w_reduce_q,
+            )
+
+            w_reduce_kv = shardops.all_gather(
+                "2 d_model/d n_kv/t d_head -> 2 d_model n_kv/t d_head",
+                jnp.bfloat16(self.w_reduce_kv),
+            )
 
             reduce_k, reduce_v = hidden_mult * shardops.einsum_unreduced(
-                "B/d n_blocks block_size M/t, k_v block_size b_size -> k_v B/d n_blocks b_size M/t",
+                "B/d n_blocks block_size d_model, k_v d_model n_kv/t d_head -> k_v B/d n_blocks block_size n_kv/t d_head",
                 x,
-                self.w_reduce_kv,
+                w_reduce_kv,
             )
             logits = shardops.einsum_unreduced(
-                "1 M/t, B/d n_blocks block_size M/t -> B/d n_blocks 1 block_size M/t",
+                "1 n_q_per_kv n_kv/t d_head, B/d n_blocks block_size n_kv/t d_head -> B/d 1 n_blocks block_size n_q_per_kv n_kv/t",
                 w_reduce_q,
                 reduce_k,
                 preferred_element_type=jnp.float32,
             )
 
-            attn_weights = jnp.bfloat16(jax.nn.softmax(logits, axis=-1))
+            attn_wei = jnp.bfloat16(jax.nn.softmax(logits, axis=-1))
 
-            x = shardops.einsum_unreduced(
-                "B/d n_blocks 1 block_size M/t, B/d n_blocks block_size M/t -> B/d n_blocks M/t",
-                attn_weights,
+            attn_out = shardops.einsum_unreduced(
+                "B/d 1 n_blocks block_size n_q_per_kv n_kv/t, B/d n_blocks block_size n_kv/t d_head -> B/d n_blocks n_q_per_kv n_kv/t d_head",
+                attn_wei,
                 reduce_v,
             )
+
+            w_reduce_o = shardops.all_gather(
+                "d_model/d n_q_per_kv n_kv/t d_head -> d_model n_q_per_kv n_kv/t d_head",
+                jnp.bfloat16(self.w_reduce_o),
+            )
+            attn_out = hidden_mult * shardops.einsum_unreduced(
+                "B/d n_blocks n_q_per_kv n_kv/t d_head, d_model n_q_per_kv n_kv/t d_head -> B/d n_blocks d_model",
+                attn_out,
+                w_reduce_o,
+            )
+            x = shardops.psum_scatter(
+                "B/d n_blocks d_model -> B/d n_blocks d_model/t", attn_out
+            )
+
         elif h.reduction_strategy == "cnn":
             pass
 
@@ -1264,6 +1308,7 @@ def training_step(
             w_mix=1.0,
             w_reduce_q=1.0,
             w_reduce_kv=1.0,
+            w_reduce_o=1.0,
         )
 
         if hparams.use_grad_clip:

@@ -535,7 +535,8 @@ class Model:
         x_causal_mask = q_pos[:, None] // h.block_size >= k_pos[None, :]
         x_causal_mask = x_causal_mask[jnp.newaxis, ..., jnp.newaxis, jnp.newaxis]
 
-        rope_table = RopeTable.create(L, h, pos_mult=h.block_size)
+        rope_table = RopeTable.create(L, h)
+        x_rope_table = RopeTable.create(L, h, h.block_size)
         concept_rope_table = RopeTable.create(n_blocks, h)
 
         # Encoder block
@@ -815,7 +816,7 @@ class Model:
                     "B/d L M, M Q K/t D -> B/d L Q K/t D", nx, x_w_q
                 )
             )
-            q = rope_table.apply("L D -> 1 L 1 1 D", q)
+            q = x_rope_table.apply("L D -> 1 L 1 1 D", q)
 
             x_w_kv = shardops.all_gather(
                 "2 M/d K/t D -> 2 M K/t D", jnp.bfloat16(x_w_kv)

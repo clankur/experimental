@@ -68,7 +68,6 @@ class BaseWidths:
     n_kv: int
     d_head: int
     d_ff: int
-    block_size: int
 
 
 @dataclass(frozen=True)
@@ -434,7 +433,7 @@ class Model:
         x_lnz = jnp.ones((h.n_t_layers, h.d_model), dtype=jnp.float32)
 
         # Initialize w_mix for weighted sum reduction
-        block_size_scale = (h.block_size / h.base.block_size) ** -p.hidden_param_mult
+        block_size_scale = (1.0 / math.sqrt(h.block_size)) ** p.hidden_param_mult
         w_mix = block_size_scale * jax.random.truncated_normal(
             fold_in_str(rng, "w_mix"), -2, 2, (h.block_size, 1), dtype=jnp.float32
         )
@@ -917,7 +916,6 @@ class Model:
                 x,
                 self.w_reduce_kv,
             )
-            print(reduce_k.shape)
             logits = shardops.einsum_unreduced(
                 "1 M/t, B/d n_blocks block_size M/t -> B/d n_blocks 1 block_size M/t",
                 w_reduce_q,

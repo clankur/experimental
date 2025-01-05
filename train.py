@@ -531,7 +531,7 @@ class Model:
         ]
         q_pos = jnp.arange(L)
         k_pos = jnp.arange(L // h.block_size)
-        x_causal_mask = q_pos[:, None] // h.block_size >= k_pos[None, :]
+        x_causal_mask = q_pos[:, None] // h.block_size > k_pos[None, :]
         x_causal_mask = x_causal_mask[jnp.newaxis, ..., jnp.newaxis, jnp.newaxis]
 
         rope_table = RopeTable.create(L, h)

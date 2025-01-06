@@ -47,14 +47,14 @@ import typing
 from collections.abc import Sequence
 from contextvars import ContextVar
 from enum import IntEnum
-from typing import Any, Union
+from typing import Any, Union, get_args, get_origin
 from typeguard import check_type_internal, typechecked
 import jax
 import jax.numpy as jnp
 from types import GenericAlias
 from typeguard import TypeCheckError, TypeCheckerCallable
 import dataclasses
-from dataclasses import dataclass
+from dataclasses import dataclass, make_dataclass
 from typeguard import checker_lookup_functions
 
 
@@ -316,18 +316,43 @@ def pytree_dataclass(cls):
     return cls
 
 
+class Array:
+    """If `cls` is an array type or a `pytree_dataclass` of array types,
+    `Array[axes, cls]` will extend `cls` with leading axes `axes`.
+    For example, `Array['layers', f32['batch d_model']] returns f32['layers batch d_model`]`.
+    """
+
+    def __class_getitem__(cls, x):
+        axes, input_cls = x
+        if isinstance(axes, str):
+            axes = axes.encode("utf-8")
+        elif isinstance(axes, bytes):
+            pass
+        else:
+            raise ValueError(f"input axes to {cls} must be Union[bytes, str]")
+
+        if dataclasses.is_dataclass(input_cls):
+            extended_fields = []
+            for fld in dataclasses.fields(input_cls):
+                extended_type = Array[axes, fld.type]
+                extended_fields.append((fld.name, extended_type))
+
+            extended_cls = make_dataclass(
+                input_cls.__name__, extended_fields, bases=(input_cls,)
+            )
+            pytree_dataclass(extended_cls)
+            return extended_cls
+        else:
+            number_type, shape = get_origin(input_cls), get_args(input_cls)
+            extended_shape = (axes + b" " + shape[0],)
+            return GenericAlias(number_type, extended_shape)
+
+
 def make_partition_specs(cls):
     """Instantiates a pytree dataclass with a PartitionSpec at array type."""
+    # Check for a tuple type:
     origin = typing.get_origin(cls)
     args = typing.get_args(cls)
-    if origin is Union:
-        # Find the non-None type in the Union
-        array_type = next((arg for arg in args if arg is not type(None)), None)
-        if array_type is None:
-            raise ValueError(f"Union type {cls} must have at least one non-None type")
-        return make_partition_specs(array_type)
-
-    # Check for a tuple type:
     if origin is tuple:
         return tuple(make_partition_specs(arg) for arg in args)
     elif origin is not None and issubclass(origin, number):

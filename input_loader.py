@@ -30,7 +30,6 @@ import random
 from typeguard import typechecked
 from shardlib.shardtypes import bool_, pytree_dataclass, u32
 import shardlib.shardtypes as shardtypes
-from synthetic_loader import SyntheticGenerator
 import zarr
 from dataclasses import dataclass
 import jax
@@ -61,9 +60,6 @@ class TokenBatch:
 
     targets: u32["batch/d len"]
     is_seq_start: bool_["batch/d len"]
-    comment_starts: Union[u32["batch/d n_prints"], None] = None
-    comment_ends: Union[u32["batch/d n_prints"], None] = None
-    loss_masks: Union[bool_["batch/d len"], None] = None
 
 
 @dataclass(frozen=True)
@@ -494,55 +490,6 @@ class HuggingFaceDataLoader:
         return TokenBatch(tokens, is_start)
 
 
-@dataclass(frozen=True)
-class SyntheticDataParams:
-    seed: int = 0
-
-
-class SyntheticDataLoader:
-    def __init__(
-        self,
-        split: str,
-        config: SyntheticDataParams,
-        token_batch_params: TokenBatchParams,
-    ):
-        assert split in ["train", "validation"], "Invalid split"
-        self.base_seed = (
-            config.seed + (1 if split == "validation" else 0) + jax.process_index()
-        )
-        random.seed(self.base_seed)
-        self.iterator = SyntheticGenerator(
-            token_batch_params.len, token_batch_params.batch
-        )
-        self.batch_size = token_batch_params.batch
-        self.max_seq_len = token_batch_params.len
-        self.max_token_id = len(self.iterator.tokenizer.vocab) - 1
-
-        self.sharding = shardtypes.make_shardings(TokenBatch).targets
-
-    def load(self, step: int):
-
-        shape = (self.batch_size, self.max_seq_len)
-        tokens, comment_starts, comment_ends, loss_masks = next(self.iterator)
-        is_seq_start = jnp.zeros((shape), dtype=jnp.bool)
-        is_seq_start = is_seq_start.at[:, 0].set(1)
-
-        def get_shard(x: jax.Array, indexing: Tuple[slice]) -> jax.Array:
-            shard = x[indexing]
-            return shard
-
-        tokens = jax.make_array_from_callback(
-            shape, self.sharding, functools.partial(get_shard, tokens)
-        )
-        is_seq_start = jax.make_array_from_callback(
-            shape, self.sharding, functools.partial(get_shard, is_seq_start)
-        )
-
-        return TokenBatch(
-            tokens, is_seq_start, comment_starts, comment_ends, loss_masks
-        )
-
-
 def get_loader(
     split: str,
     config: Union[FlatTokensParams, HuggingFaceDataParams],
@@ -552,8 +499,5 @@ def get_loader(
         return ShufflingLoader(split, config, token_batch_params)
     elif isinstance(config, HuggingFaceDataParams):
         return HuggingFaceDataLoader(split, config, token_batch_params)
-    elif isinstance(config, SyntheticDataParams):
-        return SyntheticDataLoader(split, config, token_batch_params)
-
     else:
         raise ValueError(f"Unknown config type {type(config)}")

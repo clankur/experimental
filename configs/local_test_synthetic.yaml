@@ -6,15 +6,12 @@ defaults:
 - _self_
 
 training:
-  warmup_steps: 5
+  warmup_steps: 10
   steps:        50
-  steps_for_lr: 50
+  steps_for_lr: 100
   tokens:
     batch: 64
     len: 64
-  use_grad_clip: true
-  use_gpu: false
-  use_single_pod: false
 
 model:
   d_model: 256
@@ -22,9 +19,10 @@ model:
   n_kv: 2
   d_head: 32
   layers: 2
-  vocab: 32768 
+  vocab: 1280 
   d_ff: 1024
   rope_max_timescale: 256
+  
   a_attn: 1
   a_output: 1
   zero_queries: true
@@ -41,7 +39,6 @@ model:
   gamma_hidden: 1. 
   gamma_unembed: 1. 
 
-
 paths:
   root_working_dir: '/tmp'
 
@@ -54,8 +51,8 @@ mesh:
 
 flat_tokens:
   filespec: 'synthetic_dataset.zarr'
-  streams: 1
-  read_blocks_per_shuffle_buffer: 128
-  sequences_per_read_block: 1024
+  streams: 2
+  read_blocks_per_shuffle_buffer: 8
+  sequences_per_read_block: 16
   seed: 0
   sequence_packing: true

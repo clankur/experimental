@@ -369,9 +369,13 @@ class Model:
         e_w_kv_shape = (h.n_e_layers, 2, h.d_model, h.n_kv, h.d_head)
         e_ff_shape = (h.n_e_layers, h.d_model, h.d_ff)
 
-        e_w_q = w_q_scale * jax.random.truncated_normal(
-            fold_in_str(rng, "e_w_q"), -2, 2, e_w_q_shape, dtype=jnp.float32
-        )
+        if h.zero_queries:
+            e_w_q = jnp.zeros(e_w_q_shape, dtype=jnp.float32)
+        else:
+            e_w_q = w_q_scale * jax.random.truncated_normal(
+                fold_in_str(rng, "e_w_q"), -2, 2, e_w_q_shape, dtype=jnp.float32
+            )
+
         e_w_kv = w_kv_scale * jax.random.truncated_normal(
             fold_in_str(rng, "e_w_kv"), -2, 2, e_w_kv_shape, dtype=jnp.float32
         )
@@ -396,9 +400,27 @@ class Model:
         t_w_kv_shape = (h.n_t_layers, 2, h.d_model, h.n_kv, h.d_head)
         t_ff_shape = (h.n_t_layers, h.d_model, h.d_ff)
 
-        t_w_q = w_q_scale * jax.random.truncated_normal(
-            fold_in_str(rng, "t_w_q"), -2, 2, t_w_q_shape, dtype=jnp.float32
-        )
+        if h.zero_queries:
+            t_w_q = jnp.zeros(t_w_q_shape, dtype=jnp.float32)
+            x_w_q = jnp.zeros(t_w_q_shape, dtype=jnp.float32)
+            w_reduce_q = jnp.zeros(
+                (1, h.n_q_per_kv, h.n_kv, h.d_head), dtype=jnp.float32
+            )
+        else:
+            t_w_q = w_q_scale * jax.random.truncated_normal(
+                fold_in_str(rng, "t_w_q"), -2, 2, t_w_q_shape, dtype=jnp.float32
+            )
+            x_w_q = w_q_scale * jax.random.truncated_normal(
+                fold_in_str(rng, "x_w_q"), -2, 2, t_w_q_shape, dtype=jnp.float32
+            )
+            w_reduce_q = w_q_scale * jax.random.truncated_normal(
+                fold_in_str(rng, "w_reduce_q"),
+                -2,
+                2,
+                (1, h.n_q_per_kv, h.n_kv, h.d_head),
+                dtype=jnp.float32,
+            )
+
         t_w_kv = w_kv_scale * jax.random.truncated_normal(
             fold_in_str(rng, "t_w_kv"), -2, 2, t_w_kv_shape, dtype=jnp.float32
         )
@@ -416,9 +438,6 @@ class Model:
         )
 
         # Initialize cross attention weights for token decoder
-        x_w_q = w_q_scale * jax.random.truncated_normal(
-            fold_in_str(rng, "x_w_q"), -2, 2, t_w_q_shape, dtype=jnp.float32
-        )
         x_w_kv = w_kv_scale * jax.random.truncated_normal(
             fold_in_str(rng, "x_w_kv"), -2, 2, t_w_kv_shape, dtype=jnp.float32
         )
@@ -437,15 +456,6 @@ class Model:
         )
 
         # Initialize w_reduce_q as a learned query vector
-        w_reduce_q = w_q_scale * jax.random.truncated_normal(
-            fold_in_str(rng, "w_reduce_q"),
-            -2,
-            2,
-            (1, h.n_q_per_kv, h.n_kv, h.d_head),
-            dtype=jnp.float32,
-        )
-
-        # Initialize reduction weights for k/v
         w_reduce_kv = w_kv_scale * jax.random.truncated_normal(
             fold_in_str(rng, "w_reduce_kv"),
             -2,
@@ -454,7 +464,7 @@ class Model:
             dtype=jnp.float32,
         )
 
-        # Initialize reduction weights for output
+        # Initialize reduction weights for k/v
         w_reduce_o = w_o_scale * jax.random.truncated_normal(
             fold_in_str(rng, "w_reduce_o"),
             -2,

@@ -266,6 +266,7 @@ class Model:
     concept_decoder: ConceptDecoder
     token_decoder: TokenDecoder
     final_layer_norm: f32["d_model/d/t"]
+    reduce_ln: f32["d_model/d/t"]
 
     # Cross attention weights for token decoder
     x_w_q: f32["n_t_layers d_model/d n_q_per_kv n_kv/t d_head"]
@@ -274,8 +275,7 @@ class Model:
     x_lnx: f32["n_t_layers d_model/t/d"]
     x_lnz: f32["n_t_layers d_model/t/d"]
 
-    w_mix: f32["block_size 1"]  # Separate tensor for weighted sum reduction
-
+    w_mix: f32["block_size 1"]
     w_reduce_q: f32["1 n_q_per_kv n_kv/t d_head/d"]
     w_reduce_kv: f32["2 d_model/d n_kv/t d_head"]
     w_reduce_o: f32["d_model/d n_q_per_kv n_kv/t d_head"]
@@ -287,6 +287,7 @@ class Model:
         ln1 = jnp.ones((h.layers, h.d_model), dtype=jnp.float32)
         ln2 = jnp.ones((h.layers, h.d_model), dtype=jnp.float32)
         final_layer_norm = jnp.ones((h.d_model,), dtype=jnp.float32)
+        reduce_ln = jnp.ones((h.d_model,), dtype=jnp.float32)
 
         # All of wi/wq/wo/wo/w_kv use truncated_normal initializers with 'fan_in' scaling,
         # i.e. variance set to 1.0/fan_in.
@@ -496,6 +497,7 @@ class Model:
                 w_down=t_w_down,
             ),
             final_layer_norm=final_layer_norm,
+            reduce_ln=reduce_ln,
             x_w_q=x_w_q,
             x_w_kv=x_w_kv,
             x_w_o=x_w_o,
@@ -921,13 +923,18 @@ class Model:
 
         # Process input through encoder blocks
         x, () = jax.lax.scan(encoder_block, jnp.bfloat16(x), self.encoder)
+
+        # Add layer norm before reduction with dedicated weights
+        reduce_ln = shardops.all_gather("M/t/d -> M", jnp.float32(self.reduce_ln))
+        x = shardops.all_gather("B/d L M/t -> B/d L M", x)
+        x = jnp.bfloat16(rms_norm(x) * reduce_ln)
+        x = shardops.psum_scatter("B/d L M -> B/d L M/t", x)
         x = einops.rearrange(
             x,
             "B (n_blocks block_size) M -> B n_blocks block_size M",
             n_blocks=n_blocks,
         )
         # reduce for each chunk of block_size to a single embedding
-
         if h.reduction_strategy == "sum" or h.reduction_strategy == "max":
             x = einops.reduce(
                 x, "B n_blocks block_size M -> B n_blocks M", h.reduction_strategy
@@ -963,7 +970,7 @@ class Model:
                 w_reduce_q,
                 reduce_k,
                 preferred_element_type=jnp.float32,
-            )
+            ) / math.sqrt(h.d_head)
 
             attn_wei = jnp.bfloat16(jax.nn.softmax(logits, axis=-1))
 
@@ -1247,6 +1254,7 @@ def training_step(
                 w_down=h.gamma_hidden * (h.d_ff / base.d_ff) ** -p.hidden_lr,
             ),
             final_layer_norm=1.0,
+            reduce_ln=1.0,
             x_w_q=h.gamma_hidden * (h.d_model / base.d_model) ** -p.hidden_lr,
             x_w_kv=h.gamma_hidden * (h.d_model / base.d_model) ** -p.hidden_lr,
             x_w_o=h.gamma_hidden * (target_head_dim / base_head_dim) ** -p.hidden_lr,

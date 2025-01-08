@@ -105,6 +105,11 @@ class Hparams:
     gamma_hidden: float
     gamma_unembed: float
 
+    # clustering parameters
+    clustering_start_fraction: float = (
+        0.0  # When to start applying clustering mask, as a fraction of total steps
+    )
+
 
 def get_parameterization(style: str, fully_aligned: bool = True):
     Parameterization = namedtuple(
@@ -420,7 +425,11 @@ class Model:
 
     @typechecked
     def forward_pass(
-        self, h: Hparams, ids: u32[b"B/d L"], is_seq_start: bool_[b"B/d L"]
+        self,
+        h: Hparams,
+        ids: u32[b"B/d L"],
+        is_seq_start: bool_[b"B/d L"],
+        use_clustering: u32[b""],
     ) -> Tuple[f32[b"B/d L V/t"], Tuple[f32[b""], f32[b""]]]:
         p = get_parameterization(h.parameterization)
         embed_mult = (h.d_model / h.base.d_model) ** -p.embed_param_mult
@@ -576,7 +585,11 @@ class Model:
             )
 
             qk_mask = q_to_cluster == k_to_cluster
-            att_mask = jnp.logical_and(causal_mask, qk_mask)
+
+            # Apply clustering mask using jnp.where
+            att_mask = jnp.where(
+                use_clustering, jnp.logical_and(causal_mask, qk_mask), causal_mask
+            )
 
             q_selected = (
                 einops.rearrange(q_nope, "B Qlen H half_D -> B H 1 Qlen half_D")
@@ -670,7 +683,10 @@ class Model:
 
     @typechecked
     def loss(
-        self, h: Hparams, batch: TokenBatch
+        self,
+        h: Hparams,
+        batch: TokenBatch,
+        use_clustering: u32[b""],
     ) -> Tuple[f32[b""], Tuple[f32[b""], f32[b""], f32[b""]]]:
         # Given sequence-packed targets:
         #   [[1, 2], [3, 4, 5], [6, 7, 8, 9]]
@@ -683,7 +699,7 @@ class Model:
         inputs: u32[b"batch/d len"] = jnp.where(is_seq_start, 0, inputs)
 
         logits, (q_alignments, k_alignments) = self.forward_pass(
-            h, inputs, is_seq_start
+            h, inputs, is_seq_start, use_clustering
         )
         max_logits: f32[b"batch/d len 1"] = lax.pmax(
             jnp.max(lax.stop_gradient(logits), axis=-1, keepdims=True), "t"
@@ -701,7 +717,7 @@ class Model:
         tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
         ce_loss = -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
         total_loss = ce_loss - (q_alignments + k_alignments)
-        return total_loss, (ce_loss, q_alignments, k_alignments)
+        return ce_loss, (ce_loss, q_alignments, k_alignments)
 
 
 @pytree_dataclass
@@ -803,8 +819,13 @@ def training_step(
     def sharded_step(
         state: State, step: u32[b""], batch: TokenBatch
     ) -> Tuple[State, Metrics]:
+        # Determine if we should use clustering based on training progress
+        use_clustering = jnp.array(
+            step >= int(hparams.steps * h.clustering_start_fraction), dtype=jnp.uint32
+        )
+
         ((loss, (ce_loss, q_alignments, k_alignments)), grad) = jax.value_and_grad(
-            lambda weights: weights.loss(h, batch), has_aux=True
+            lambda weights: weights.loss(h, batch, use_clustering), has_aux=True
         )(state.weights)
         # Gradients have already been reduced across chips because the gradient of the weight `all_gather`
         # is weight-gradient `psum_scatter`. Loss, on the other hand, hasn't been reduced across chips: if we

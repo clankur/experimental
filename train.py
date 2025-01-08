@@ -541,12 +541,6 @@ class Model:
                 k,
                 preferred_element_type=jnp.float32,
             )
-            logits = jnp.where(causal_mask, logits, -1e10)
-            probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
-            attn_out = shardops.einsum_unreduced(
-                "B/d Qlen Klen H/t, B/d Klen H/t D -> B/d Qlen H/t D", probs, v
-            )
-
             # clustering
             clusters = shardops.all_gather(
                 "n_clusters H/t half_D/d -> n_clusters H/t half_D",
@@ -554,12 +548,12 @@ class Model:
             )
             q_alignment = shardops.einsum_unreduced(
                 "B/d Qlen H/t half_D, n_clusters H/t half_D -> B/d H/t Qlen n_clusters",
-                q_nope,
+                lax.stop_gradient(q_nope),
                 clusters,
             )
             k_alignment = shardops.einsum_unreduced(
-                "B/d Qlen H/t half_D, n_clusters H/t half_D -> B/d H/t Qlen n_clusters",
-                k_nope,
+                "B/d Klen H/t half_D, n_clusters H/t half_D -> B/d H/t Klen n_clusters",
+                lax.stop_gradient(k_nope),
                 clusters,
             )
             q_to_cluster = jnp.argmax(q_alignment, axis=-1)
@@ -572,6 +566,18 @@ class Model:
                 jax.nn.one_hot(k_to_cluster, h.n_clusters),
                 "B H Qlen n_clusters -> B H n_clusters Qlen 1",
             )
+            k_to_cluster = einops.rearrange(
+                k_to_cluster,
+                "B H Klen -> B Klen 1 H",
+            )
+            q_to_cluster = einops.rearrange(
+                q_to_cluster,
+                "B H Qlen -> B 1 Qlen H",
+            )
+
+            qk_mask = q_to_cluster == k_to_cluster
+            att_mask = jnp.logical_and(causal_mask, qk_mask)
+
             q_selected = (
                 einops.rearrange(q_nope, "B Qlen H half_D -> B H 1 Qlen half_D")
                 * cluster_q_alignment_mask
@@ -590,6 +596,12 @@ class Model:
                 k_selected * cluster_k_alignment_mask,
                 "B H n_clusters Qlen half_D -> ",
                 "mean",
+            )
+
+            logits = jnp.where(att_mask, logits, -1e10)
+            probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
+            attn_out = shardops.einsum_unreduced(
+                "B/d Qlen Klen H/t, B/d Klen H/t D -> B/d Qlen H/t D", probs, v
             )
 
             w_o = shardops.all_gather(

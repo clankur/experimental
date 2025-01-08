@@ -567,6 +567,21 @@ class Model:
             # Normalize clusters to have L2 norm of 1 along the half_D dimension
             clusters = clusters / jnp.linalg.norm(clusters, axis=-1, keepdims=True)
 
+            cluster_alignment = shardops.einsum_unreduced(
+                "n_clusters H/t half_D, n_clusters2 H/t half_D -> H/t n_clusters n_clusters2",
+                clusters,
+                clusters,
+            )
+            # Mask out self-alignment (diagonal) since it will always be 1
+            cluster_mask = 1.0 - jnp.eye(h.n_clusters)[None]
+            cluster_alignment = cluster_alignment * cluster_mask
+            # Average over non-diagonal elements
+            avg_cluster_alignment = einops.reduce(
+                cluster_alignment, "H n_clusters n_clusters2 -> H n_clusters", "mean"
+            ) * (
+                h.n_clusters / (h.n_clusters - 1)
+            )  # Adjust for removed diagonal
+
             # Apply layer norm to q_nope and k_nope before clustering
             ln_q_nope = shardops.all_gather(
                 "half_D/t/d -> half_D", jnp.float32(layer_weights.ln_q_nope)
@@ -577,15 +592,6 @@ class Model:
 
             nq_nope = jnp.bfloat16(rms_norm(q_nope) * ln_q_nope)
             nk_nope = jnp.bfloat16(rms_norm(k_nope) * ln_k_nope)
-
-            cluster_alignment = shardops.einsum_unreduced(
-                "n_clusters H/t half_D, n_clusters2 H/t half_D -> H/t n_clusters n_clusters2",
-                clusters,
-                clusters,
-            )
-            avg_cluster_alignment = einops.reduce(
-                cluster_alignment, "H n_clusters n_clusters2 -> ", "mean"
-            )
 
             q_alignment = shardops.einsum_unreduced(
                 "B/d Qlen H/t half_D, n_clusters H/t half_D -> B/d H/t Qlen n_clusters",
@@ -697,7 +703,7 @@ class Model:
                 avg_cluster_alignment,
             )
 
-        x, (q_alignments, k_alignments, avg_cluster_alignment) = jax.lax.scan(
+        x, (q_alignments, k_alignments, avg_cluster_alignments) = jax.lax.scan(
             loop_body, jnp.bfloat16(x), self.transformer
         )
 
@@ -718,7 +724,7 @@ class Model:
         return logits, (
             q_alignments.sum(),
             k_alignments.sum(),
-            avg_cluster_alignment.sum(),
+            avg_cluster_alignments.sum(),
         )
 
     @typechecked

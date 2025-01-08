@@ -57,6 +57,18 @@ from jax.tree_util import tree_leaves
 
 PRNGKey = Any
 
+# TODO:
+# setup cluster centroids
+# calc avg_wei_k = probs @ K
+# alignments = avg_wei_k @ centroids
+# argmax(alignments)
+# build calibration mask
+#   for each centroids, mask the avg_wei_ks most aligned with the centroid
+# average the masked avg_wei_ks and the centroids to get new centroids
+# repeat till calibrated (?) - we need to work this out on what it means to be calibrated
+# once calibrated, we can use the centroids to do the attention, instead of the ks
+#    what do we use for the values?
+
 
 @dataclass(frozen=True)
 class BaseWidths:
@@ -78,6 +90,7 @@ class Hparams:
     vocab: int
     layers: int
     base: BaseWidths
+    n_clusters: int
 
     # fields for position embeddings
     rope_max_timescale: int
@@ -241,6 +254,7 @@ class TransformerLayer:
     w_gate: f32["d_model/d d_ff/t"]
     w_up: f32["d_model/d d_ff/t"]
     w_down: f32["d_model/d d_ff/t"]
+    clusters: f32["n_clusters n_h/t d_head_half/d"]
 
 
 Transformer = Array["layers", TransformerLayer]
@@ -378,6 +392,11 @@ class Model:
 
         ln_compressed = jnp.ones((h.layers, h.d_compressed), dtype=jnp.float32)
 
+        clusters_shape = (h.layers, h.n_clusters, h.n_h, d_head_half)
+        clusters = d_model_scale * jax.random.truncated_normal(
+            fold_in_str(rng, "clusters"), -2, 2, clusters_shape, dtype=jnp.float32
+        )
+
         arrays = Model(
             embed=embed,
             unembed=unembed,
@@ -395,6 +414,7 @@ class Model:
                 w_gate=w_gate,
                 w_up=w_up,
                 w_down=w_down,
+                clusters=clusters,
             ),
             final_layer_norm=final_layer_norm,
         )
@@ -529,6 +549,37 @@ class Model:
             attn_out = shardops.einsum_unreduced(
                 "B/d Qlen Klen H/t, B/d Klen H/t D -> B/d Qlen H/t D", probs, v
             )
+
+            # clustering
+            avg_wei_k_nope = shardops.einsum_unreduced(
+                "B/d Qlen Klen H/t, B/d Klen H/t half_D -> B/d Qlen H/t half_D",
+                probs,
+                k_nope,
+            )
+            clusters = shardops.all_gather(
+                "n_clusters H/t half_D/d -> n_clusters H/t half_D",
+                layer_weights.clusters,
+            )
+            alignments = shardops.einsum_unreduced(
+                "B/d Qlen H/t half_D, n_clusters H/t half_D -> B/d H/t Qlen n_clusters",
+                avg_wei_k_nope,
+                clusters,
+            )
+            key_to_cluster = jnp.argmax(alignments, axis=-1)
+            calibration_mask = einops.rearrange(
+                jax.nn.one_hot(key_to_cluster, h.n_clusters),
+                "B H Qlen n_clusters -> B H n_clusters Qlen 1",
+            )
+            avg_wei_k_nope = einops.rearrange(
+                avg_wei_k_nope, "B Qlen H half_D -> B H 1 Qlen half_D"
+            )
+
+            avg_wei_k_nope = einops.reduce(
+                avg_wei_k_nope * calibration_mask,
+                "B H n_clusters Qlen half_D -> B H n_clusters half_D",
+                "sum",
+            )
+
             w_o = shardops.all_gather(
                 "M/d H/t D -> M H/t D", jnp.bfloat16(layer_weights.w_o)
             )
@@ -786,6 +837,7 @@ def training_step(
                 w_gate=h.gamma_hidden * (h.d_model / base.d_model) ** -p.hidden_lr,
                 w_up=h.gamma_hidden * (h.d_model / base.d_model) ** -p.hidden_lr,
                 w_down=h.gamma_hidden * (h.d_ff / base.d_ff) ** -p.hidden_lr,
+                clusters=1.0,
             ),
             final_layer_norm=1.0,
         )

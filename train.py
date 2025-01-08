@@ -700,7 +700,7 @@ class Model:
         )
         tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
         ce_loss = -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
-        total_loss = ce_loss + q_alignments + k_alignments
+        total_loss = ce_loss - (q_alignments + k_alignments)
         return total_loss, (ce_loss, q_alignments, k_alignments)
 
 
@@ -749,6 +749,9 @@ class Metrics:
     learning_rate: f32[b""]
     grad_norm: f32[b""]
     raw_grad_norm: f32[b""]
+    q_alignments: f32[b""]
+    k_alignments: f32[b""]
+    total_loss: f32[b""]
 
 
 @dataclass(frozen=True)
@@ -924,10 +927,13 @@ def training_step(
             adam_nu=jax.tree_util.tree_unflatten(grad_treedef, new_nus),
         )
         metrics = Metrics(
-            loss=loss,
+            loss=ce_loss,
             learning_rate=lr,
             grad_norm=global_norm * rescale,
             raw_grad_norm=global_norm,
+            q_alignments=q_alignments,
+            k_alignments=k_alignments,
+            total_loss=loss,
         )
         return new_state, metrics
 
@@ -1030,6 +1036,9 @@ def main_contained(config, logger):
             cum_metrics.grad_norm += metrics.grad_norm
             cum_metrics.raw_grad_norm += metrics.raw_grad_norm
             cum_metrics.learning_rate += metrics.learning_rate
+            cum_metrics.q_alignments += metrics.q_alignments
+            cum_metrics.k_alignments += metrics.k_alignments
+            cum_metrics.total_loss += metrics.total_loss
 
         start_time = time.time()
 
@@ -1098,6 +1107,9 @@ def main_contained(config, logger):
                         learning_rate=cum_metrics.learning_rate / log_interval,
                         grad_norm=cum_metrics.grad_norm / log_interval,
                         raw_grad_norm=cum_metrics.raw_grad_norm / log_interval,
+                        q_alignments=cum_metrics.q_alignments / log_interval,
+                        k_alignments=cum_metrics.k_alignments / log_interval,
+                        total_loss=cum_metrics.total_loss / log_interval,
                     )
                 else:
                     cum_metrics = output

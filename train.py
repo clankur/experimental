@@ -432,7 +432,7 @@ class Model:
         ids: u32[b"B/d L"],
         is_seq_start: bool_[b"B/d L"],
         use_clustering: u32[b""],
-    ) -> Tuple[f32[b"B/d L V/t"], Tuple[f32[b""], f32[b""]]]:
+    ) -> Tuple[f32[b"B/d L V/t"], Tuple[f32[b""], f32[b""], f32[b""]]]:
         p = get_parameterization(h.parameterization)
         embed_mult = (h.d_model / h.base.d_model) ** -p.embed_param_mult
         hidden_mult = (h.d_model / h.base.d_model) ** -p.hidden_param_mult
@@ -559,6 +559,14 @@ class Model:
             )
             # Normalize clusters to have L2 norm of 1 along the half_D dimension
             clusters = clusters / jnp.linalg.norm(clusters, axis=-1, keepdims=True)
+            cluster_alignment = shardops.einsum_unreduced(
+                "n_clusters H/t half_D, n_clusters2 H/t half_D -> H/t n_clusters n_clusters2",
+                clusters,
+                clusters,
+            )
+            avg_cluster_alignment = einops.reduce(
+                cluster_alignment, "H n_clusters n_clusters2 -> ", "mean"
+            )
 
             q_alignment = shardops.einsum_unreduced(
                 "B/d Qlen H/t half_D, n_clusters H/t half_D -> B/d H/t Qlen n_clusters",
@@ -664,9 +672,13 @@ class Model:
             )
             ffn_out = shardops.psum_scatter("B/d L M -> B/d L M/t", ffn_out)
 
-            return jnp.bfloat16(x + ffn_out), (q_alignment_scalar, k_alignment_scalar)
+            return jnp.bfloat16(x + ffn_out), (
+                q_alignment_scalar,
+                k_alignment_scalar,
+                avg_cluster_alignment,
+            )
 
-        x, (q_alignments, k_alignments) = jax.lax.scan(
+        x, (q_alignments, k_alignments, avg_cluster_alignment) = jax.lax.scan(
             loop_body, jnp.bfloat16(x), self.transformer
         )
 
@@ -684,7 +696,11 @@ class Model:
             preferred_element_type=jnp.float32,
         )
 
-        return logits, (q_alignments.sum(), k_alignments.sum())
+        return logits, (
+            q_alignments.sum(),
+            k_alignments.sum(),
+            avg_cluster_alignment.sum(),
+        )
 
     @typechecked
     def loss(
@@ -692,7 +708,7 @@ class Model:
         h: Hparams,
         batch: TokenBatch,
         use_clustering: u32[b""],
-    ) -> Tuple[f32[b""], Tuple[f32[b""], f32[b""], f32[b""]]]:
+    ) -> Tuple[f32[b""], Tuple[f32[b""], f32[b""], f32[b""], f32[b""]]]:
         # Given sequence-packed targets:
         #   [[1, 2], [3, 4, 5], [6, 7, 8, 9]]
         # we want inputs:
@@ -703,7 +719,7 @@ class Model:
         is_seq_start: bool_[b"batch/d len"] = batch.is_seq_start
         inputs: u32[b"batch/d len"] = jnp.where(is_seq_start, 0, inputs)
 
-        logits, (q_alignments, k_alignments) = self.forward_pass(
+        logits, (q_alignments, k_alignments, avg_cluster_alignment) = self.forward_pass(
             h, inputs, is_seq_start, use_clustering
         )
         max_logits: f32[b"batch/d len 1"] = lax.pmax(
@@ -725,7 +741,12 @@ class Model:
             tokens_in_global_batch
         )
         total_loss = ce_loss + alignment_loss
-        return total_loss, (ce_loss, q_alignments, k_alignments)
+        return total_loss, (
+            ce_loss,
+            q_alignments,
+            k_alignments,
+            avg_cluster_alignment,
+        )
 
 
 @pytree_dataclass
@@ -775,6 +796,7 @@ class Metrics:
     raw_grad_norm: f32[b""]
     q_alignments: f32[b""]
     k_alignments: f32[b""]
+    avg_cluster_alignment: f32[b""]
     total_loss: f32[b""]
 
 
@@ -832,9 +854,11 @@ def training_step(
             step >= int(hparams.steps * h.clustering_start_fraction), dtype=jnp.uint32
         )
 
-        ((loss, (ce_loss, q_alignments, k_alignments)), grad) = jax.value_and_grad(
-            lambda weights: weights.loss(h, batch, use_clustering), has_aux=True
-        )(state.weights)
+        ((loss, (ce_loss, q_alignments, k_alignments, avg_cluster_alignment)), grad) = (
+            jax.value_and_grad(
+                lambda weights: weights.loss(h, batch, use_clustering), has_aux=True
+            )(state.weights)
+        )
         # Gradients have already been reduced across chips because the gradient of the weight `all_gather`
         # is weight-gradient `psum_scatter`. Loss, on the other hand, hasn't been reduced across chips: if we
         # did that inside the autodiff, we'd be double-reducing the loss, effectively multiplying it by the
@@ -845,6 +869,7 @@ def training_step(
         ce_loss = jax.lax.psum(ce_loss, ("d", "t"))
         q_alignments = jax.lax.psum(q_alignments, ("d", "t"))
         k_alignments = jax.lax.psum(k_alignments, ("d", "t"))
+        avg_cluster_alignment = jax.lax.psum(avg_cluster_alignment, ("d", "t"))
 
         # Other than global-norm of gradients, no other communication is needed during the weight update,
         # because weights and grads are already fully sharded, as checked below.
@@ -967,6 +992,7 @@ def training_step(
             raw_grad_norm=global_norm,
             q_alignments=q_alignments,
             k_alignments=k_alignments,
+            avg_cluster_alignment=avg_cluster_alignment,
             total_loss=loss,
         )
         return new_state, metrics
@@ -1067,6 +1093,7 @@ def main_contained(config, logger):
         def update_metrics(metrics: Metrics):
             nonlocal cum_metrics
             cum_metrics.loss += metrics.loss
+            cum_metrics.avg_cluster_alignment += metrics.avg_cluster_alignment
             cum_metrics.grad_norm += metrics.grad_norm
             cum_metrics.raw_grad_norm += metrics.raw_grad_norm
             cum_metrics.learning_rate += metrics.learning_rate
@@ -1138,6 +1165,8 @@ def main_contained(config, logger):
                 if cum_metrics:
                     cum_metrics = Metrics(
                         loss=cum_metrics.loss / log_interval,
+                        avg_cluster_alignment=cum_metrics.avg_cluster_alignment
+                        / log_interval,
                         learning_rate=cum_metrics.learning_rate / log_interval,
                         grad_norm=cum_metrics.grad_norm / log_interval,
                         raw_grad_norm=cum_metrics.raw_grad_norm / log_interval,

@@ -246,6 +246,8 @@ class TransformerLayer:
     ln1: f32["d_model/t/d"]
     ln2: f32["d_model/t/d"]
     ln_compressed: f32["d_compressed/t/d"]
+    ln_q_nope: f32["d_head_half/t/d"]
+    ln_k_nope: f32["d_head_half/t/d"]
     w_q_pe: f32["d_model/d n_h/t d_head_half"]
     w_q_nope: f32["d_model/d n_h/t d_head_half"]
     w_k_pe: f32["d_model/d/t d_head_half"]
@@ -275,6 +277,9 @@ class Model:
         # https://github.com/google/jax/issues/20390 for ones_like with sharding.
         ln1 = jnp.ones((h.layers, h.d_model), dtype=jnp.float32)
         ln2 = jnp.ones((h.layers, h.d_model), dtype=jnp.float32)
+        ln_compressed = jnp.ones((h.layers, h.d_compressed), dtype=jnp.float32)
+        ln_q_nope = jnp.ones((h.layers, h.d_head // 2), dtype=jnp.float32)
+        ln_k_nope = jnp.ones((h.layers, h.d_head // 2), dtype=jnp.float32)
         final_layer_norm = jnp.ones((h.d_model,), dtype=jnp.float32)
 
         # All of wi/wq/wo/wo/w_kv use truncated_normal initializers with 'fan_in' scaling,
@@ -408,6 +413,8 @@ class Model:
                 ln1=ln1,
                 ln2=ln2,
                 ln_compressed=ln_compressed,
+                ln_q_nope=ln_q_nope,
+                ln_k_nope=ln_k_nope,
                 w_q_pe=w_q_pe,
                 w_q_nope=w_q_nope,
                 w_k_pe=w_k_pe,
@@ -559,6 +566,18 @@ class Model:
             )
             # Normalize clusters to have L2 norm of 1 along the half_D dimension
             clusters = clusters / jnp.linalg.norm(clusters, axis=-1, keepdims=True)
+
+            # Apply layer norm to q_nope and k_nope before clustering
+            ln_q_nope = shardops.all_gather(
+                "half_D/t/d -> half_D", jnp.float32(layer_weights.ln_q_nope)
+            )
+            ln_k_nope = shardops.all_gather(
+                "half_D/t/d -> half_D", jnp.float32(layer_weights.ln_k_nope)
+            )
+
+            nq_nope = jnp.bfloat16(rms_norm(q_nope) * ln_q_nope)
+            nk_nope = jnp.bfloat16(rms_norm(k_nope) * ln_k_nope)
+
             cluster_alignment = shardops.einsum_unreduced(
                 "n_clusters H/t half_D, n_clusters2 H/t half_D -> H/t n_clusters n_clusters2",
                 clusters,
@@ -570,12 +589,12 @@ class Model:
 
             q_alignment = shardops.einsum_unreduced(
                 "B/d Qlen H/t half_D, n_clusters H/t half_D -> B/d H/t Qlen n_clusters",
-                lax.stop_gradient(q_nope),
+                lax.stop_gradient(nq_nope),
                 clusters,
             )
             k_alignment = shardops.einsum_unreduced(
                 "B/d Klen H/t half_D, n_clusters H/t half_D -> B/d H/t Klen n_clusters",
-                lax.stop_gradient(k_nope),
+                lax.stop_gradient(nk_nope),
                 clusters,
             )
             q_to_cluster = jnp.argmax(q_alignment, axis=-1)
@@ -780,8 +799,16 @@ class RopeTable:
 
 @typechecked
 def rms_norm(
-    x: Union[bf16[b"batch/d len M"], bf16[b"batch/d len d_compressed"]]
-) -> Union[bf16[b"batch/d len M"], bf16[b"batch/d len d_compressed"]]:
+    x: Union[
+        bf16[b"batch/d len M"],
+        bf16[b"batch/d len d_compressed"],
+        bf16[b"batch/d len h/t half_D"],
+    ]
+) -> Union[
+    bf16[b"batch/d len M"],
+    bf16[b"batch/d len d_compressed"],
+    bf16[b"batch/d len h/t half_D"],
+]:
     mean2 = save_for_backward(
         jnp.mean(jax.lax.square(jnp.float32(x)), axis=-1, keepdims=True)
     )
@@ -919,6 +946,8 @@ def training_step(
                 ln1=1.0,
                 ln2=1.0,
                 ln_compressed=1.0,
+                ln_q_nope=1.0,
+                ln_k_nope=1.0,
                 w_q_pe=h.gamma_hidden * (h.d_model / base.d_model) ** -p.hidden_lr,
                 w_q_nope=h.gamma_hidden * (h.d_model / base.d_model) ** -p.hidden_lr,
                 w_k_pe=h.gamma_hidden * (h.d_model / base.d_model) ** -p.hidden_lr,

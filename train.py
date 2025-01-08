@@ -398,6 +398,8 @@ class Model:
         clusters = d_model_scale * jax.random.truncated_normal(
             fold_in_str(rng, "clusters"), -2, 2, clusters_shape, dtype=jnp.float32
         )
+        # Normalize clusters to have L2 norm of 1 along the half_D dimension
+        clusters = clusters / jnp.linalg.norm(clusters, axis=-1, keepdims=True)
 
         arrays = Model(
             embed=embed,
@@ -555,6 +557,9 @@ class Model:
                 "n_clusters H/t half_D/d -> n_clusters H/t half_D",
                 layer_weights.clusters,
             )
+            # Normalize clusters to have L2 norm of 1 along the half_D dimension
+            clusters = clusters / jnp.linalg.norm(clusters, axis=-1, keepdims=True)
+
             q_alignment = shardops.einsum_unreduced(
                 "B/d Qlen H/t half_D, n_clusters H/t half_D -> B/d H/t Qlen n_clusters",
                 lax.stop_gradient(q_nope),
@@ -717,7 +722,7 @@ class Model:
         tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
         ce_loss = -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
         total_loss = ce_loss - (q_alignments + k_alignments)
-        return ce_loss, (ce_loss, q_alignments, k_alignments)
+        return total_loss, (ce_loss, q_alignments, k_alignments)
 
 
 @pytree_dataclass
@@ -834,6 +839,9 @@ def training_step(
         #
         # So we reduce the loss across chips _outside_ the autodiff.
         loss = jax.lax.psum(loss, ("d", "t"))
+        ce_loss = jax.lax.psum(ce_loss, ("d", "t"))
+        q_alignments = jax.lax.psum(q_alignments, ("d", "t"))
+        k_alignments = jax.lax.psum(k_alignments, ("d", "t"))
 
         # Other than global-norm of gradients, no other communication is needed during the weight update,
         # because weights and grads are already fully sharded, as checked below.
@@ -859,7 +867,9 @@ def training_step(
         # AdamW optimizer with global gradient clipping.
         grad_leaves, grad_treedef = jax.tree_util.tree_flatten(grad)
         global_norm_square = jnp.float32(0.0)
-        for g in grad_leaves:
+        for key, g in vars(grad.transformer).items():
+            if "clusters" in key:
+                continue
             assert g.dtype == jnp.float32
             global_norm_square += jnp.sum(jax.lax.square(g))
         global_norm_square = jax.lax.psum(global_norm_square, ("d", "t"))

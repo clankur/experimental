@@ -57,17 +57,14 @@ from jax.tree_util import tree_leaves
 
 PRNGKey = Any
 
+
 # TODO:
 # setup cluster centroids
-# calc avg_wei_k = probs @ K
-# alignments = avg_wei_k @ centroids
-# argmax(alignments)
-# build calibration mask
-#   for each centroids, mask the avg_wei_ks most aligned with the centroid
-# average the masked avg_wei_ks and the centroids to get new centroids
-# repeat till calibrated (?) - we need to work this out on what it means to be calibrated
-# once calibrated, we can use the centroids to do the attention, instead of the ks
-#    what do we use for the values?
+# compute q_alignment = q dot centroid,  k_alignment = k dot centroid
+# reduce q_alignment, k_alignment to scalar values
+# loss -= q_alignment + k_alignment
+# lax.stop_gradient(q_alignment)
+# lax.stop_gradient(k_alignment)
 
 
 @dataclass(frozen=True)
@@ -424,7 +421,7 @@ class Model:
     @typechecked
     def forward_pass(
         self, h: Hparams, ids: u32[b"B/d L"], is_seq_start: bool_[b"B/d L"]
-    ) -> f32[b"B/d L V/t"]:
+    ) -> Tuple[f32[b"B/d L V/t"], Tuple[f32[b""], f32[b""]]]:
         p = get_parameterization(h.parameterization)
         embed_mult = (h.d_model / h.base.d_model) ** -p.embed_param_mult
         hidden_mult = (h.d_model / h.base.d_model) ** -p.hidden_param_mult
@@ -456,10 +453,10 @@ class Model:
 
         ##### Transformer blocks.
         @explicit_activation_checkpointing
-        @typechecked
+        # @typechecked
         def loop_body(
             x: bf16[b"B/d L M/t"], layer_weights: TransformerLayer
-        ) -> Tuple[bf16[b"B/d L M/t"], Tuple[()]]:
+        ) -> Tuple[bf16[b"B/d L M/t"], f32[b""], Tuple[()]]:
             # Pre-attention RMSNorm
             ln1 = shardops.all_gather("M/t/d -> M", jnp.float32(layer_weights.ln1))
             gx = shardops.all_gather("B/d L M/t -> B/d L M", x)
@@ -551,33 +548,48 @@ class Model:
             )
 
             # clustering
-            avg_wei_k_nope = shardops.einsum_unreduced(
-                "B/d Qlen Klen H/t, B/d Klen H/t half_D -> B/d Qlen H/t half_D",
-                probs,
-                k_nope,
-            )
             clusters = shardops.all_gather(
                 "n_clusters H/t half_D/d -> n_clusters H/t half_D",
                 layer_weights.clusters,
             )
-            alignments = shardops.einsum_unreduced(
+            q_alignment = shardops.einsum_unreduced(
                 "B/d Qlen H/t half_D, n_clusters H/t half_D -> B/d H/t Qlen n_clusters",
-                avg_wei_k_nope,
+                q_nope,
                 clusters,
             )
-            key_to_cluster = jnp.argmax(alignments, axis=-1)
-            calibration_mask = einops.rearrange(
-                jax.nn.one_hot(key_to_cluster, h.n_clusters),
+            k_alignment = shardops.einsum_unreduced(
+                "B/d Qlen H/t half_D, n_clusters H/t half_D -> B/d H/t Qlen n_clusters",
+                k_nope,
+                clusters,
+            )
+            q_to_cluster = jnp.argmax(q_alignment, axis=-1)
+            cluster_q_alignment_mask = einops.rearrange(
+                jax.nn.one_hot(q_to_cluster, h.n_clusters),
                 "B H Qlen n_clusters -> B H n_clusters Qlen 1",
             )
-            avg_wei_k_nope = einops.rearrange(
-                avg_wei_k_nope, "B Qlen H half_D -> B H 1 Qlen half_D"
+            k_to_cluster = jnp.argmax(k_alignment, axis=-1)
+            cluster_k_alignment_mask = einops.rearrange(
+                jax.nn.one_hot(k_to_cluster, h.n_clusters),
+                "B H Qlen n_clusters -> B H n_clusters Qlen 1",
+            )
+            q_selected = (
+                einops.rearrange(q_nope, "B Qlen H half_D -> B H 1 Qlen half_D")
+                * cluster_q_alignment_mask
+            )
+            k_selected = (
+                einops.rearrange(k_nope, "B Qlen H half_D -> B H 1 Qlen half_D")
+                * cluster_k_alignment_mask
             )
 
-            avg_wei_k_nope = einops.reduce(
-                avg_wei_k_nope * calibration_mask,
-                "B H n_clusters Qlen half_D -> B H n_clusters half_D",
-                "sum",
+            q_alignment_scalar = einops.reduce(
+                q_selected,
+                "B H n_clusters Qlen half_D -> ",
+                "mean",
+            )
+            k_alignment_scalar = einops.reduce(
+                k_selected * cluster_k_alignment_mask,
+                "B H n_clusters Qlen half_D -> ",
+                "mean",
             )
 
             w_o = shardops.all_gather(
@@ -622,9 +634,11 @@ class Model:
             )
             ffn_out = shardops.psum_scatter("B/d L M -> B/d L M/t", ffn_out)
 
-            return jnp.bfloat16(x + ffn_out), ()
+            return jnp.bfloat16(x + ffn_out), (q_alignment_scalar, k_alignment_scalar)
 
-        x, () = jax.lax.scan(loop_body, jnp.bfloat16(x), self.transformer)
+        x, (q_alignments, k_alignments) = jax.lax.scan(
+            loop_body, jnp.bfloat16(x), self.transformer
+        )
 
         ##### Final layernorm and output projection.
         x = shardops.all_gather("B/d L M/t -> B/d L M", x)
@@ -640,10 +654,12 @@ class Model:
             preferred_element_type=jnp.float32,
         )
 
-        return logits
+        return logits, (q_alignments.sum(), k_alignments.sum())
 
     @typechecked
-    def loss(self, h: Hparams, batch: TokenBatch) -> f32[b""]:
+    def loss(
+        self, h: Hparams, batch: TokenBatch
+    ) -> Tuple[f32[b""], Tuple[f32[b""], f32[b""], f32[b""]]]:
         # Given sequence-packed targets:
         #   [[1, 2], [3, 4, 5], [6, 7, 8, 9]]
         # we want inputs:
@@ -654,7 +670,9 @@ class Model:
         is_seq_start: bool_[b"batch/d len"] = batch.is_seq_start
         inputs: u32[b"batch/d len"] = jnp.where(is_seq_start, 0, inputs)
 
-        logits: f32[b"batch/d len V/t"] = self.forward_pass(h, inputs, is_seq_start)
+        logits, (q_alignments, k_alignments) = self.forward_pass(
+            h, inputs, is_seq_start
+        )
         max_logits: f32[b"batch/d len 1"] = lax.pmax(
             jnp.max(lax.stop_gradient(logits), axis=-1, keepdims=True), "t"
         )
@@ -669,7 +687,9 @@ class Model:
             "batch/d len -> batch/d len/t", logprobs_at_targets
         )
         tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
-        return -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
+        ce_loss = -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
+        total_loss = ce_loss + q_alignments + k_alignments
+        return total_loss, (ce_loss, q_alignments, k_alignments)
 
 
 @pytree_dataclass
@@ -768,9 +788,9 @@ def training_step(
     def sharded_step(
         state: State, step: u32[b""], batch: TokenBatch
     ) -> Tuple[State, Metrics]:
-        loss, grad = jax.value_and_grad(lambda weights: weights.loss(h, batch))(
-            state.weights
-        )
+        ((loss, (ce_loss, q_alignments, k_alignments)), grad) = jax.value_and_grad(
+            lambda weights: weights.loss(h, batch), has_aux=True
+        )(state.weights)
         # Gradients have already been reduced across chips because the gradient of the weight `all_gather`
         # is weight-gradient `psum_scatter`. Loss, on the other hand, hasn't been reduced across chips: if we
         # did that inside the autodiff, we'd be double-reducing the loss, effectively multiplying it by the

@@ -721,7 +721,10 @@ class Model:
         )
         tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
         ce_loss = -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
-        total_loss = ce_loss - (q_alignments + k_alignments)
+        alignment_loss = -(q_alignments + k_alignments) / jnp.float32(
+            tokens_in_global_batch
+        )
+        total_loss = ce_loss + alignment_loss
         return total_loss, (ce_loss, q_alignments, k_alignments)
 
 

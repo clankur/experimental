@@ -557,11 +557,11 @@ class Model:
                 "mean",
             )
 
-            logits = jnp.where(att_mask, logits, -1e10)
 
             if h.apply_alibi:
                 logits = alibi.apply(logits)
-            logits = jnp.where(causal_mask, logits, -1e10)
+
+            logits = jnp.where(att_mask, logits, -1e10)
             probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
             attn_out = shardops.einsum_unreduced(
                 "B/d Qlen Klen Q K/t, B/d Klen K/t D -> B/d Qlen Q K/t D", probs, v

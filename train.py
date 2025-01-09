@@ -421,8 +421,8 @@ class Model:
         @explicit_activation_checkpointing
         # @typechecked
         def loop_body(
-            x: bf16["B/d L M/t"], layer_weights: TransformerLayer
-        ) -> Tuple[bf16["B/d L M/t"], f32[""], Tuple[()]]:
+            x: bf16[b"B/d L M/t"], layer_weights: TransformerLayer
+        ) -> Tuple[bf16[b"B/d L M/t"], f32[b""], Tuple[()]]:
             # Pre-attention RMSNorm
             ln1 = shardops.all_gather("M/t/d -> M", jnp.float32(layer_weights.ln1))
             gx = shardops.all_gather("B/d L M/t -> B/d L M", x)
@@ -449,7 +449,7 @@ class Model:
             k = save_for_backward(k)
             v = save_for_backward(v)
             if h.apply_rope:
-                k = rope_table.apply("L D -> 1 L 1 D", k)
+                k = rope_table.apply("L d -> 1 L 1 d", k)
 
             logit_scale = jax.lax.select(
                 h.parameterization.lower() == "mup",
@@ -479,13 +479,16 @@ class Model:
             cluster_mask = 1.0 - jnp.eye(h.n_clusters)[None, None]
             cluster_alignment = cluster_alignment * cluster_mask
             # Average over non-diagonal elements
-            avg_cluster_alignment = einops.reduce(
-                cluster_alignment,
-                "Q K n_clusters n_clusters2 -> Q K n_clusters",
-                "mean",
-            ) * (
-                h.n_clusters / (h.n_clusters - 1)
-            )  # Adjust for removed diagonal
+            # Special case for n_clusters = 1 to avoid division by zero
+            if h.n_clusters > 1:
+                avg_cluster_alignment = einops.reduce(
+                    cluster_alignment,
+                    "Q K n_clusters n_clusters2 -> Q K n_clusters",
+                    "sum",
+                ) / (h.n_clusters - 1)
+            else:
+                # For n_clusters = 1, there are no non-diagonal elements, so set to 0
+                avg_cluster_alignment = jnp.zeros_like(cluster_alignment)
 
             # Apply layer norm to q and k before clustering
             ln_q_nope = shardops.all_gather(

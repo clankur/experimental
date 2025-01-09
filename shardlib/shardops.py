@@ -216,6 +216,18 @@ def pmean_across_replicas(pspec: jax.sharding.PartitionSpec, x):
             return x
 
 
+def arange(name: str, stop, start=0, step=1, dtype=jnp.float32):
+    a_size = axis_size(name)
+    total_elements = (stop - start) // step
+    assert total_elements % a_size == 0, "total elements must be divisible by axis size"
+
+    axis_idx = jax.lax.axis_index(name)
+    range_size = total_elements // a_size
+    axis_start = range_size * axis_idx
+    indices = (jax.lax.iota(jnp.float32, range_size) + axis_start) * step
+    return indices.astype(dtype)
+
+
 def axis_size(name: str) -> int:
     """Return the size of the axis with the given name."""
     return jax.lax.psum(1, name)

@@ -79,9 +79,6 @@ class Hparams:
     layers: int
     base: BaseWidths
 
-    # fields for position embeddings
-    rope_max_timescale: int
-
     # parameters for mup
     a_attn: float
     a_output: float
@@ -94,6 +91,11 @@ class Hparams:
     gamma_embed: float
     gamma_hidden: float
     gamma_unembed: float
+
+    # fields for position embeddings
+    rope_max_timescale: int
+    apply_rope: Optional[bool] = True
+    apply_alibi: Optional[bool] = False
 
 
 def get_parameterization(style: str, fully_aligned: bool = True):
@@ -360,7 +362,6 @@ class Model:
         )
         one_hot_ids = jax.nn.one_hot(ids, self.embed.shape[0])
         x = shardops.einsum_unreduced("B/d L V/t, V/t M -> B/d L M", one_hot_ids, embed)
-
         x = shardops.psum_scatter("B/d L M -> B/d L M/t", x)
 
         L = ids.shape[1]
@@ -376,7 +377,11 @@ class Model:
         )[jnp.newaxis, ..., jnp.newaxis, jnp.newaxis]
         causal_mask: bool_[b"B/d L L 1 1"] = jnp.logical_and(segment_mask, causal_mask)
 
-        rope_table = RopeTable.create(L, h)
+        if h.apply_rope:
+            rope_table = RopeTable.create(L, h)
+
+        if h.apply_alibi:
+            alibi = Alibi.create(h)
 
         ##### Transformer blocks.
         @explicit_activation_checkpointing
@@ -399,7 +404,9 @@ class Model:
                     "B/d L M, M Q K/t D -> B/d L Q K/t D", nx, w_q
                 )
             )
-            q = rope_table.apply("L D -> 1 L 1 1 D", q)
+            if h.apply_rope:
+                q = rope_table.apply("L D -> 1 L 1 1 D", q)
+
             w_kv = shardops.all_gather(
                 "2 M/d K/t D -> 2 M K/t D", jnp.bfloat16(layer_weights.w_kv)
             )
@@ -408,7 +415,8 @@ class Model:
             )
             k = save_for_backward(k)
             v = save_for_backward(v)
-            k = rope_table.apply("L d -> 1 L 1 d", k)
+            if h.apply_rope:
+                k = rope_table.apply("L d -> 1 L 1 d", k)
 
             logit_scale = jax.lax.select(
                 h.parameterization.lower() == "mup",
@@ -421,6 +429,8 @@ class Model:
                 k,
                 preferred_element_type=jnp.float32,
             )
+            if h.apply_alibi:
+                logits = alibi.apply(logits)
             logits = jnp.where(causal_mask, logits, -1e10)
             probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
             attn_out = shardops.einsum_unreduced(
@@ -516,6 +526,30 @@ class Model:
         )
         tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
         return -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
+
+
+@pytree_dataclass
+class Alibi:
+    slopes: f32["K/t"]
+
+    def create(hparams: Hparams) -> "Alibi":
+        n_kv = hparams.n_kv
+        start = 2.0 ** (-(2.0 ** -(jnp.log2(n_kv) - 3)))
+        slopes = start * (start ** shardops.arange("t", n_kv))
+
+        return Alibi(slopes=slopes)
+
+    def apply(self, logits: f32["B/d Qlen Klen Q K/t"]) -> f32["1 Qlen Klen 1 K/t"]:
+        Qlen = logits.shape[1]
+        slopes = einops.rearrange(self.slopes, "K -> 1 1 1 K")
+
+        position_bias = jnp.arange(Qlen)[None, :] - jnp.arange(Qlen)[:, None]
+        position_bias = einops.rearrange(position_bias, "Qlen Klen -> Qlen Klen 1 1")
+
+        bias: f32["1 Qlen Klen 1 K/t"] = einops.rearrange(
+            position_bias * slopes, "Qlen Klen 1 K -> 1 Qlen Klen 1 K"
+        )
+        return logits + bias
 
 
 @pytree_dataclass

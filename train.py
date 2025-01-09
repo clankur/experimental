@@ -104,7 +104,7 @@ class Hparams:
 
     # fields for position embeddings
     rope_max_timescale: int
-    apply_rope: Optional[bool] = True
+    apply_rope: Optional[bool] = False
     apply_alibi: Optional[bool] = False
 
     clustering_start_fraction: float = 0.0

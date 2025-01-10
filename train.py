@@ -572,15 +572,19 @@ class Model:
                 clusters,
                 clusters,
             )
+
             # Mask out self-alignment (diagonal) since it will always be 1
             cluster_mask = 1.0 - jnp.eye(h.n_clusters)[None]
             cluster_alignment = cluster_alignment * cluster_mask
-            # Average over non-diagonal elements
-            avg_cluster_alignment = einops.reduce(
-                cluster_alignment, "H n_clusters n_clusters2 -> H n_clusters", "mean"
-            ) * (
-                h.n_clusters / (h.n_clusters - 1)
-            )  # Adjust for removed diagonal
+            if h.n_clusters > 1:
+                avg_cluster_alignment = einops.reduce(
+                    cluster_alignment,
+                    "H n_clusters n_clusters2 -> H n_clusters",
+                    "mean",
+                ) / (h.n_clusters - 1)
+            else:
+                # For n_clusters = 1, there are no non-diagonal elements, so set to 0
+                avg_cluster_alignment = jnp.zeros_like(cluster_alignment)
 
             # Apply layer norm to q_nope and k_nope before clustering
             ln_q_nope = shardops.all_gather(

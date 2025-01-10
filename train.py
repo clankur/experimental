@@ -241,6 +241,16 @@ class SyntheticMetrics:
 
 
 @pytree_dataclass
+class LoopMetrics:
+    q_alignment_scalar: f32[b""]
+    k_alignment_scalar: f32[b""]
+    avg_q_cluster_alignment: f32[b""]
+    avg_k_cluster_alignment: f32[b""]
+    avg_n_keys_used: f32[b""]
+    ce_loss: f32[b""]
+
+
+@pytree_dataclass
 class TransformerLayer:
     ln1: f32["d_model/t/d"]
     ln2: f32["d_model/t/d"]
@@ -252,7 +262,8 @@ class TransformerLayer:
     w_gate: f32["d_model/d d_ff/t"]
     w_up: f32["d_model/d d_ff/t"]
     w_down: f32["d_model/d d_ff/t"]
-    clusters: f32["n_clusters n_q_per_kv n_kv/t d_head/d"]
+    q_clusters: f32["n_clusters n_q_per_kv n_kv/t d_head/d"]
+    k_clusters: f32["n_clusters n_q_per_kv n_kv/t d_head/d"]
 
 
 Transformer = Array["layers", TransformerLayer]
@@ -350,12 +361,9 @@ class Model:
             )
 
         clusters_shape = (h.layers, h.n_clusters, h.n_q_per_kv, h.n_kv, h.d_head)
-        clusters = d_model_scale * jax.random.truncated_normal(
-            fold_in_str(rng, "clusters"), -2, 2, clusters_shape, dtype=jnp.float32
+        k_clusters = q_clusters = d_model_scale * jax.random.truncated_normal(
+            fold_in_str(rng, "q_clusters"), -2, 2, clusters_shape, dtype=jnp.float32
         )
-        # Normalize clusters to have L2 norm of 1 along the half_D dimension
-        clusters = clusters / jnp.linalg.norm(clusters, axis=-1, keepdims=True)
-
         arrays = Model(
             embed=embed,
             unembed=unembed,
@@ -370,7 +378,8 @@ class Model:
                 w_gate=w_gate,
                 w_up=w_up,
                 w_down=w_down,
-                clusters=clusters,
+                q_clusters=q_clusters,
+                k_clusters=k_clusters,
             ),
             final_layer_norm=final_layer_norm,
         )
@@ -384,7 +393,7 @@ class Model:
         ids: u32[b"B/d L"],
         is_seq_start: bool_[b"B/d L"],
         use_clustering: u32[b""],
-    ) -> Tuple[f32[b"B/d L V/t"], Tuple[f32[b""], f32[b""], f32[b""], f32[b""]]]:
+    ) -> Tuple[f32[b"B/d L V/t"], LoopMetrics]:
         p = get_parameterization(h.parameterization)
         embed_mult = (h.d_model / h.base.d_model) ** -p.embed_param_mult
         hidden_mult = (h.d_model / h.base.d_model) ** -p.hidden_param_mult
@@ -419,10 +428,9 @@ class Model:
 
         ##### Transformer blocks.
         @explicit_activation_checkpointing
-        # @typechecked
         def loop_body(
             x: bf16[b"B/d L M/t"], layer_weights: TransformerLayer
-        ) -> Tuple[bf16[b"B/d L M/t"], f32[b""], Tuple[()]]:
+        ) -> Tuple[bf16[b"B/d L M/t"], LoopMetrics]:
             # Pre-attention RMSNorm
             ln1 = shardops.all_gather("M/t/d -> M", jnp.float32(layer_weights.ln1))
             gx = shardops.all_gather("B/d L M/t -> B/d L M", x)
@@ -463,32 +471,63 @@ class Model:
                 preferred_element_type=jnp.float32,
             )
             # clustering
-            clusters = shardops.all_gather(
+            q_clusters = shardops.all_gather(
                 "n_clusters Q K/t D/d -> n_clusters Q K/t D",
-                layer_weights.clusters,
+                layer_weights.q_clusters,
             )
             # Normalize clusters to have L2 norm of 1 along the D dimension
-            clusters = clusters / jnp.linalg.norm(clusters, axis=-1, keepdims=True)
+            q_clusters = q_clusters / jnp.linalg.norm(
+                q_clusters, axis=-1, keepdims=True
+            )
+            k_clusters = shardops.all_gather(
+                "n_clusters Q K/t D/d -> n_clusters Q K/t D",
+                layer_weights.k_clusters,
+            )
+            # Normalize clusters to have L2 norm of 1 along the D dimension
+            k_clusters = k_clusters / jnp.linalg.norm(
+                k_clusters, axis=-1, keepdims=True
+            )
 
-            cluster_alignment = shardops.einsum_unreduced(
+            q_cluster_alignment = shardops.einsum_unreduced(
                 "n_clusters Q K/t D, n_clusters2 Q K/t D -> Q K/t n_clusters n_clusters2",
-                clusters,
-                clusters,
+                q_clusters,
+                q_clusters,
             )
             # Mask out self-alignment (diagonal) since it will always be 1
-            cluster_mask = 1.0 - jnp.eye(h.n_clusters)[None, None]
-            cluster_alignment = cluster_alignment * cluster_mask
+            q_cluster_mask = 1.0 - jnp.eye(h.n_clusters)[None, None]
+            q_cluster_alignment = q_cluster_alignment * q_cluster_mask
             # Average over non-diagonal elements
             # Special case for n_clusters = 1 to avoid division by zero
             if h.n_clusters > 1:
-                avg_cluster_alignment = einops.reduce(
-                    cluster_alignment,
+                avg_q_cluster_alignment = einops.reduce(
+                    q_cluster_alignment,
                     "Q K n_clusters n_clusters2 -> Q K n_clusters",
                     "sum",
                 ) / (h.n_clusters - 1)
             else:
                 # For n_clusters = 1, there are no non-diagonal elements, so set to 0
-                avg_cluster_alignment = jnp.zeros_like(cluster_alignment)
+                avg_q_cluster_alignment = jnp.zeros_like(q_cluster_alignment)
+
+            # Calculate k cluster alignment
+            k_cluster_alignment = shardops.einsum_unreduced(
+                "n_clusters Q K/t D, n_clusters2 Q K/t D -> Q K/t n_clusters n_clusters2",
+                k_clusters,
+                k_clusters,
+            )
+            # Mask out self-alignment (diagonal) since it will always be 1
+            k_cluster_mask = 1.0 - jnp.eye(h.n_clusters)[None, None]
+            k_cluster_alignment = k_cluster_alignment * k_cluster_mask
+            # Average over non-diagonal elements
+            # Special case for n_clusters = 1 to avoid division by zero
+            if h.n_clusters > 1:
+                avg_k_cluster_alignment = einops.reduce(
+                    k_cluster_alignment,
+                    "Q K n_clusters n_clusters2 -> Q K n_clusters",
+                    "sum",
+                ) / (h.n_clusters - 1)
+            else:
+                # For n_clusters = 1, there are no non-diagonal elements, so set to 0
+                avg_k_cluster_alignment = jnp.zeros_like(k_cluster_alignment)
 
             # Apply layer norm to q and k before clustering
             ln_q_nope = shardops.all_gather(
@@ -497,21 +536,24 @@ class Model:
             ln_k_nope = shardops.all_gather(
                 "D/t/d -> D", jnp.float32(layer_weights.ln_k_nope)
             )
-            nq = jnp.bfloat16(rms_norm(q) * ln_q_nope)  # B/d L Q K/t D
-            nk = jnp.bfloat16(rms_norm(k) * ln_k_nope)  # B/d L K/t D
+            nq = jnp.bfloat16(rms_norm(q))  # B/d L Q K/t D
+            nk = jnp.bfloat16(rms_norm(k))  # B/d L K/t D
 
             # Compute alignments with clusters
             q_alignment = shardops.einsum_unreduced(
                 "B/d Qlen Q K/t D, n_clusters Q K/t D -> B/d Q K/t Qlen n_clusters",
                 lax.stop_gradient(nq),
-                clusters,
+                q_clusters,
             )
             k_alignment = shardops.einsum_unreduced(
                 "B/d Klen K/t D, n_clusters Q K/t D -> B/d Q K/t Klen n_clusters",
                 lax.stop_gradient(nk),
-                clusters,
+                k_clusters,
             )
-            q_to_cluster = jnp.argmax(q_alignment, axis=-1)  # B/d Q K/t L
+
+            q_to_cluster = jnp.argmax(
+                q_alignment, axis=-1
+            )  # cluster selected based on alignment to each queryB
             k_to_cluster = jnp.argmax(k_alignment, axis=-1)
             q_cluster_one_hot = jax.nn.one_hot(q_to_cluster, h.n_clusters)
             k_cluster_one_hot = jax.nn.one_hot(k_to_cluster, h.n_clusters)
@@ -519,11 +561,6 @@ class Model:
                 "B/d Q K/t Qlen n_clusters, B/d Q K/t Qlen n_clusters -> ",
                 q_alignment,
                 q_cluster_one_hot,
-            )
-            k_alignment_scalar = shardops.einsum_unreduced(
-                "B/d Q K/t Klen n_clusters, B/d Q K/t Klen n_clusters -> ",
-                k_alignment,
-                k_cluster_one_hot,
             )
             # create mask for qk
             k_to_cluster = einops.rearrange(
@@ -546,6 +583,28 @@ class Model:
 
             logits = jnp.where(att_mask, logits, -1e10)
             probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
+
+            #  for each q, for each head, averageing of ks
+            prob_wei_k = shardops.einsum_unreduced(
+                "B/d Qlen Klen Q K/t, B/d Klen K/t D -> B/d Qlen Q K/t D",
+                lax.stop_gradient(probs),
+                lax.stop_gradient(nk),
+            )
+
+            # use the label from the q cluster for the k cluster to select the k cluster
+            selected_k_cluster = shardops.einsum_unreduced(
+                "n_clusters Q K/t D, B/d Q K/t Qlen n_clusters -> B/d Qlen Q K/t",
+                k_clusters,
+                q_cluster_one_hot,
+            )
+            # calculate alignment loss between selected k cluster and to the prob wei k
+            # align keys to avg key query cared about
+            k_alignment_scalar = shardops.einsum_unreduced(
+                "B/d Qlen Q K/t D, B/d Qlen Q K/t -> B/d Qlen Q K/t",
+                lax.stop_gradient(prob_wei_k),
+                selected_k_cluster,
+            )
+
             attn_out = shardops.einsum_unreduced(
                 "B/d Qlen Klen Q K/t, B/d Klen K/t D -> B/d Qlen Q K/t D", probs, v
             )
@@ -591,15 +650,25 @@ class Model:
             )
             ffn_out = shardops.psum_scatter("B/d L M -> B/d L M/t", ffn_out)
 
-            return jnp.bfloat16(x + ffn_out), (
-                q_alignment_scalar,
-                k_alignment_scalar,
-                avg_cluster_alignment,
-                avg_n_keys_used,
+            return jnp.bfloat16(x + ffn_out), LoopMetrics(
+                q_alignment_scalar=q_alignment_scalar,
+                k_alignment_scalar=k_alignment_scalar,
+                avg_q_cluster_alignment=avg_q_cluster_alignment,
+                avg_k_cluster_alignment=avg_k_cluster_alignment,
+                avg_n_keys_used=avg_n_keys_used,
+                ce_loss=jnp.float32(0.0),  # This will be set in the loss function
             )
 
-        x, (q_alignments, k_alignments, avg_cluster_alignments, avg_n_keys_used) = (
-            jax.lax.scan(loop_body, jnp.bfloat16(x), self.transformer)
+        x, loop_metrics = jax.lax.scan(loop_body, jnp.bfloat16(x), self.transformer)
+
+        # Sum metrics across layers
+        loop_metrics = LoopMetrics(
+            ce_loss=jnp.float32(0.0),
+            q_alignment_scalar=jnp.sum(loop_metrics.q_alignment_scalar),
+            k_alignment_scalar=jnp.sum(loop_metrics.k_alignment_scalar),
+            avg_q_cluster_alignment=jnp.sum(loop_metrics.avg_q_cluster_alignment),
+            avg_k_cluster_alignment=jnp.sum(loop_metrics.avg_k_cluster_alignment),
+            avg_n_keys_used=jnp.mean(loop_metrics.avg_n_keys_used),
         )
 
         ##### Final layernorm and output projection.
@@ -616,12 +685,7 @@ class Model:
             preferred_element_type=jnp.float32,
         )
 
-        return logits, (
-            q_alignments.sum(),
-            k_alignments.sum(),
-            avg_cluster_alignments.sum(),
-            avg_n_keys_used.mean(),
-        )
+        return logits, loop_metrics
 
     @typechecked
     def loss(
@@ -629,7 +693,7 @@ class Model:
         h: Hparams,
         batch: TokenBatch,
         use_clustering: u32[b""],
-    ) -> Tuple[f32[b""], Tuple[f32[b""], f32[b""], f32[b""], f32[b""], f32[b""]]]:
+    ) -> Tuple[f32[b""], LoopMetrics]:
         # Given sequence-packed targets:
         #   [[1, 2], [3, 4, 5], [6, 7, 8, 9]]
         # we want inputs:
@@ -640,8 +704,8 @@ class Model:
         is_seq_start: bool_[b"batch/d len"] = batch.is_seq_start
         inputs: u32[b"batch/d len"] = jnp.where(is_seq_start, 0, inputs)
 
-        logits, (q_alignments, k_alignments, avg_cluster_alignment, avg_n_keys_used) = (
-            self.forward_pass(h, inputs, is_seq_start, use_clustering)
+        logits, loop_metrics = self.forward_pass(
+            h, inputs, is_seq_start, use_clustering
         )
         max_logits: f32[b"batch/d len 1"] = lax.pmax(
             jnp.max(lax.stop_gradient(logits), axis=-1, keepdims=True), "t"
@@ -658,17 +722,12 @@ class Model:
         )
         tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
         ce_loss = -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
-        alignment_loss = -(q_alignments + k_alignments) / jnp.float32(
-            tokens_in_global_batch
-        )
+        alignment_loss = -(
+            loop_metrics.q_alignment_scalar + loop_metrics.k_alignment_scalar
+        ) / jnp.float32(tokens_in_global_batch)
         total_loss = ce_loss + alignment_loss
-        return total_loss, (
-            ce_loss,
-            q_alignments,
-            k_alignments,
-            avg_cluster_alignment,
-            avg_n_keys_used,
-        )
+        loop_metrics = replace(loop_metrics, ce_loss=ce_loss)
+        return total_loss, loop_metrics
 
 
 @pytree_dataclass
@@ -752,7 +811,8 @@ class Metrics:
     raw_grad_norm: f32[b""]
     q_alignments: f32[b""]
     k_alignments: f32[b""]
-    avg_cluster_alignment: f32[b""]
+    avg_q_cluster_alignment: f32[b""]
+    avg_k_cluster_alignment: f32[b""]
     avg_n_keys_used: f32[b""]
     total_loss: f32[b""]
 
@@ -800,7 +860,7 @@ def training_step(
     h: Hparams,
     hparams: TrainingHparams,
     batch: TokenBatch,
-) -> Tuple[Any, Metrics]:
+) -> Tuple[State, Metrics]:
     @partial(
         shardtypes.typed_shard_map, check_rep=False
     )  # check_rep=False for https://github.com/google/jax/issues/20335
@@ -815,20 +875,12 @@ def training_step(
         (
             (
                 loss,
-                (
-                    ce_loss,
-                    q_alignments,
-                    k_alignments,
-                    avg_cluster_alignment,
-                    avg_n_keys_used,
-                ),
+                loop_metrics,
             ),
             grad,
         ) = jax.value_and_grad(
             lambda weights: weights.loss(h, batch, use_clustering), has_aux=True
-        )(
-            state.weights
-        )
+        )(state.weights)
         # Gradients have already been reduced across chips because the gradient of the weight `all_gather`
         # is weight-gradient `psum_scatter`. Loss, on the other hand, hasn't been reduced across chips: if we
         # did that inside the autodiff, we'd be double-reducing the loss, effectively multiplying it by the
@@ -836,11 +888,23 @@ def training_step(
         #
         # So we reduce the loss across chips _outside_ the autodiff.
         loss = jax.lax.psum(loss, ("d", "t"))
-        ce_loss = jax.lax.psum(ce_loss, ("d", "t"))
-        q_alignments = jax.lax.psum(q_alignments, ("d", "t"))
-        k_alignments = jax.lax.psum(k_alignments, ("d", "t"))
-        avg_cluster_alignment = jax.lax.psum(avg_cluster_alignment, ("d", "t"))
-        avg_n_keys_used = jax.lax.psum(avg_n_keys_used, ("d", "t"))
+        loop_metrics = replace(
+            loop_metrics,
+            ce_loss=jax.lax.psum(loop_metrics.ce_loss, ("d", "t")),
+            q_alignment_scalar=jax.lax.psum(
+                loop_metrics.q_alignment_scalar, ("d", "t")
+            ),
+            k_alignment_scalar=jax.lax.psum(
+                loop_metrics.k_alignment_scalar, ("d", "t")
+            ),
+            avg_q_cluster_alignment=jax.lax.psum(
+                loop_metrics.avg_q_cluster_alignment, ("d", "t")
+            ),
+            avg_k_cluster_alignment=jax.lax.psum(
+                loop_metrics.avg_k_cluster_alignment, ("d", "t")
+            ),
+            avg_n_keys_used=jax.lax.psum(loop_metrics.avg_n_keys_used, ("d", "t")),
+        )
 
         # Other than global-norm of gradients, no other communication is needed during the weight update,
         # because weights and grads are already fully sharded, as checked below.
@@ -867,7 +931,7 @@ def training_step(
         grad_leaves, grad_treedef = jax.tree_util.tree_flatten(grad)
         global_norm_square = jnp.float32(0.0)
         for key, g in vars(grad.transformer).items():
-            if "clusters" in key:
+            if "q_clusters" in key or "k_clusters" in key:
                 continue
             assert g.dtype == jnp.float32
             global_norm_square += jnp.sum(jax.lax.square(g))
@@ -897,7 +961,8 @@ def training_step(
                 w_gate=h.gamma_hidden * (h.d_model / base.d_model) ** -p.hidden_lr,
                 w_up=h.gamma_hidden * (h.d_model / base.d_model) ** -p.hidden_lr,
                 w_down=h.gamma_hidden * (h.d_ff / base.d_ff) ** -p.hidden_lr,
-                clusters=1.0,
+                q_clusters=1.0,
+                k_clusters=1.0,
             ),
             final_layer_norm=1.0,
         )
@@ -952,14 +1017,15 @@ def training_step(
             adam_nu=jax.tree_util.tree_unflatten(grad_treedef, new_nus),
         )
         metrics = Metrics(
-            loss=ce_loss,
+            loss=loop_metrics.ce_loss,
             learning_rate=lr,
             grad_norm=global_norm * rescale,
             raw_grad_norm=global_norm,
-            q_alignments=q_alignments,
-            k_alignments=k_alignments,
-            avg_cluster_alignment=avg_cluster_alignment,
-            avg_n_keys_used=avg_n_keys_used,
+            q_alignments=loop_metrics.q_alignment_scalar,
+            k_alignments=loop_metrics.k_alignment_scalar,
+            avg_q_cluster_alignment=loop_metrics.avg_q_cluster_alignment,
+            avg_k_cluster_alignment=loop_metrics.avg_k_cluster_alignment,
+            avg_n_keys_used=loop_metrics.avg_n_keys_used,
             total_loss=loss,
         )
         return new_state, metrics
@@ -1008,7 +1074,7 @@ def main_contained(config, logger):
     """Main program, which does not access external services except as specified by config.paths or logger."""
     # Use partitionable (and hopefully fusable!) RNG.
     #
-    # This is slower in compute time than 'unsafe_rbg' with flag '--xla_tpu_spmd_rng_bit_generator_unsafe=true',
+    # This is slower in compute time than 'unsafe_rbg' with flag '--xla_tpu_spmd_rng_bitgenerator_unsafe=true',
     # but hopefully faster in memory time because it's fusable.
     # TODO: check this is true and if not, provide our own that actually is fusable.
 
@@ -1060,7 +1126,8 @@ def main_contained(config, logger):
         def update_metrics(metrics: Metrics):
             nonlocal cum_metrics
             cum_metrics.loss += metrics.loss
-            cum_metrics.avg_cluster_alignment += metrics.avg_cluster_alignment
+            cum_metrics.avg_q_cluster_alignment += metrics.avg_q_cluster_alignment
+            cum_metrics.avg_k_cluster_alignment += metrics.avg_k_cluster_alignment
             cum_metrics.grad_norm += metrics.grad_norm
             cum_metrics.raw_grad_norm += metrics.raw_grad_norm
             cum_metrics.learning_rate += metrics.learning_rate
@@ -1136,7 +1203,9 @@ def main_contained(config, logger):
                 if cum_metrics:
                     cum_metrics = Metrics(
                         loss=cum_metrics.loss / log_interval,
-                        avg_cluster_alignment=cum_metrics.avg_cluster_alignment
+                        avg_q_cluster_alignment=cum_metrics.avg_q_cluster_alignment
+                        / log_interval,
+                        avg_k_cluster_alignment=cum_metrics.avg_k_cluster_alignment
                         / log_interval,
                         avg_n_keys_used=cum_metrics.avg_n_keys_used / log_interval,
                         learning_rate=cum_metrics.learning_rate / log_interval,

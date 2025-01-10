@@ -429,8 +429,9 @@ class Model:
         ##### Transformer blocks.
         @explicit_activation_checkpointing
         def loop_body(
-            x: bf16[b"B/d L M/t"], layer_weights: TransformerLayer
-        ) -> Tuple[bf16[b"B/d L M/t"], LoopMetrics]:
+            carry: Tuple[bf16[b"B/d L M/t"], int], layer_weights: TransformerLayer
+        ) -> Tuple[Tuple[bf16[b"B/d L M/t"], int], LoopMetrics]:
+            x, layer_idx = carry
             # Pre-attention RMSNorm
             ln1 = shardops.all_gather("M/t/d -> M", jnp.float32(layer_weights.ln1))
             gx = shardops.all_gather("B/d L M/t -> B/d L M", x)
@@ -575,7 +576,9 @@ class Model:
             qk_mask = q_to_cluster == k_to_cluster
             # Apply clustering mask using jnp.where
             causal_qk_mask = jnp.logical_and(causal_mask, qk_mask)
-            att_mask = jnp.where(use_clustering, causal_qk_mask, causal_mask)
+            # Only apply clustering for layers other than 0
+            use_clustering_for_layer = jnp.logical_and(use_clustering, layer_idx != 0)
+            att_mask = jnp.where(use_clustering_for_layer, causal_qk_mask, causal_mask)
             avg_n_keys_used = jnp.sum(causal_qk_mask, axis=2) / jnp.sum(
                 causal_mask, axis=2
             )
@@ -652,7 +655,7 @@ class Model:
             )
             ffn_out = shardops.psum_scatter("B/d L M -> B/d L M/t", ffn_out)
 
-            return jnp.bfloat16(x + ffn_out), LoopMetrics(
+            return (jnp.bfloat16(x + ffn_out), layer_idx + 1), LoopMetrics(
                 q_alignment_scalar=q_alignment_scalar,
                 k_alignment_scalar=k_alignment_scalar,
                 avg_q_cluster_alignment=avg_q_cluster_alignment,
@@ -661,7 +664,9 @@ class Model:
                 ce_loss=jnp.float32(0.0),  # This will be set in the loss function
             )
 
-        x, loop_metrics = jax.lax.scan(loop_body, jnp.bfloat16(x), self.transformer)
+        (x, _), loop_metrics = jax.lax.scan(
+            loop_body, (jnp.bfloat16(x), 0), self.transformer
+        )
 
         # Sum metrics across layers
         loop_metrics = LoopMetrics(
@@ -725,10 +730,7 @@ class Model:
         tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
         ce_loss = -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
         alignment_loss = -(
-            loop_metrics.q_alignment_scalar
-            + loop_metrics.k_alignment_scalar
-            - loop_metrics.avg_q_cluster_alignment
-            # - loop_metrics.avg_k_cluster_alignment
+            loop_metrics.q_alignment_scalar + loop_metrics.k_alignment_scalar
         ) / jnp.float32(tokens_in_global_batch)
         total_loss = ce_loss + alignment_loss
         loop_metrics = replace(loop_metrics, ce_loss=ce_loss)

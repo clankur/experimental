@@ -840,7 +840,7 @@ def training_step(
         q_alignments = jax.lax.psum(q_alignments, ("d", "t"))
         k_alignments = jax.lax.psum(k_alignments, ("d", "t"))
         avg_cluster_alignment = jax.lax.psum(avg_cluster_alignment, ("d", "t"))
-        avg_n_keys_used = jax.lax.psum(avg_n_keys_used, ("d", "t"))
+        avg_n_keys_used = jax.lax.pmean(avg_n_keys_used, ("d", "t"))
 
         # Other than global-norm of gradients, no other communication is needed during the weight update,
         # because weights and grads are already fully sharded, as checked below.

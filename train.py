@@ -384,7 +384,7 @@ class Model:
         ids: u32[b"B/d L"],
         is_seq_start: bool_[b"B/d L"],
         use_clustering: u32[b""],
-    ) -> Tuple[f32[b"B/d L V/t"], Tuple[f32[b""], f32[b""], f32[b""]]]:
+    ) -> Tuple[f32[b"B/d L V/t"], Tuple[f32[b""], f32[b""], f32[b""], f32[b""]]]:
         p = get_parameterization(h.parameterization)
         embed_mult = (h.d_model / h.base.d_model) ** -p.embed_param_mult
         hidden_mult = (h.d_model / h.base.d_model) ** -p.hidden_param_mult
@@ -535,6 +535,7 @@ class Model:
                 "B Q K Qlen -> B Qlen 1 Q K",
             )
             qk_mask = q_to_cluster == k_to_cluster
+            avg_n_keys_used = jnp.sum(qk_mask, axis=2) / jnp.sum(causal_mask, axis=2)
             # Apply clustering mask using jnp.where
             att_mask = jnp.where(
                 use_clustering, jnp.logical_and(causal_mask, qk_mask), causal_mask
@@ -594,10 +595,11 @@ class Model:
                 q_alignment_scalar,
                 k_alignment_scalar,
                 avg_cluster_alignment,
+                avg_n_keys_used,
             )
 
-        x, (q_alignments, k_alignments, avg_cluster_alignments) = jax.lax.scan(
-            loop_body, jnp.bfloat16(x), self.transformer
+        x, (q_alignments, k_alignments, avg_cluster_alignments, avg_n_keys_used) = (
+            jax.lax.scan(loop_body, jnp.bfloat16(x), self.transformer)
         )
 
         ##### Final layernorm and output projection.
@@ -618,6 +620,7 @@ class Model:
             q_alignments.sum(),
             k_alignments.sum(),
             avg_cluster_alignments.sum(),
+            avg_n_keys_used.mean(),
         )
 
     @typechecked
@@ -626,7 +629,7 @@ class Model:
         h: Hparams,
         batch: TokenBatch,
         use_clustering: u32[b""],
-    ) -> Tuple[f32[b""], Tuple[f32[b""], f32[b""], f32[b""], f32[b""]]]:
+    ) -> Tuple[f32[b""], Tuple[f32[b""], f32[b""], f32[b""], f32[b""], f32[b""]]]:
         # Given sequence-packed targets:
         #   [[1, 2], [3, 4, 5], [6, 7, 8, 9]]
         # we want inputs:
@@ -637,8 +640,8 @@ class Model:
         is_seq_start: bool_[b"batch/d len"] = batch.is_seq_start
         inputs: u32[b"batch/d len"] = jnp.where(is_seq_start, 0, inputs)
 
-        logits, (q_alignments, k_alignments, avg_cluster_alignment) = self.forward_pass(
-            h, inputs, is_seq_start, use_clustering
+        logits, (q_alignments, k_alignments, avg_cluster_alignment, avg_n_keys_used) = (
+            self.forward_pass(h, inputs, is_seq_start, use_clustering)
         )
         max_logits: f32[b"batch/d len 1"] = lax.pmax(
             jnp.max(lax.stop_gradient(logits), axis=-1, keepdims=True), "t"
@@ -664,6 +667,7 @@ class Model:
             q_alignments,
             k_alignments,
             avg_cluster_alignment,
+            avg_n_keys_used,
         )
 
 
@@ -749,6 +753,7 @@ class Metrics:
     q_alignments: f32[b""]
     k_alignments: f32[b""]
     avg_cluster_alignment: f32[b""]
+    avg_n_keys_used: f32[b""]
     total_loss: f32[b""]
 
 
@@ -807,10 +812,22 @@ def training_step(
             step >= int(hparams.steps * h.clustering_start_fraction), dtype=jnp.uint32
         )
 
-        ((loss, (ce_loss, q_alignments, k_alignments, avg_cluster_alignment)), grad) = (
-            jax.value_and_grad(
-                lambda weights: weights.loss(h, batch, use_clustering), has_aux=True
-            )(state.weights)
+        (
+            (
+                loss,
+                (
+                    ce_loss,
+                    q_alignments,
+                    k_alignments,
+                    avg_cluster_alignment,
+                    avg_n_keys_used,
+                ),
+            ),
+            grad,
+        ) = jax.value_and_grad(
+            lambda weights: weights.loss(h, batch, use_clustering), has_aux=True
+        )(
+            state.weights
         )
         # Gradients have already been reduced across chips because the gradient of the weight `all_gather`
         # is weight-gradient `psum_scatter`. Loss, on the other hand, hasn't been reduced across chips: if we
@@ -823,6 +840,7 @@ def training_step(
         q_alignments = jax.lax.psum(q_alignments, ("d", "t"))
         k_alignments = jax.lax.psum(k_alignments, ("d", "t"))
         avg_cluster_alignment = jax.lax.psum(avg_cluster_alignment, ("d", "t"))
+        avg_n_keys_used = jax.lax.psum(avg_n_keys_used, ("d", "t"))
 
         # Other than global-norm of gradients, no other communication is needed during the weight update,
         # because weights and grads are already fully sharded, as checked below.
@@ -941,6 +959,7 @@ def training_step(
             q_alignments=q_alignments,
             k_alignments=k_alignments,
             avg_cluster_alignment=avg_cluster_alignment,
+            avg_n_keys_used=avg_n_keys_used,
             total_loss=loss,
         )
         return new_state, metrics
@@ -1047,6 +1066,7 @@ def main_contained(config, logger):
             cum_metrics.learning_rate += metrics.learning_rate
             cum_metrics.q_alignments += metrics.q_alignments
             cum_metrics.k_alignments += metrics.k_alignments
+            cum_metrics.avg_n_keys_used += metrics.avg_n_keys_used
             cum_metrics.total_loss += metrics.total_loss
 
         start_time = time.time()
@@ -1118,6 +1138,7 @@ def main_contained(config, logger):
                         loss=cum_metrics.loss / log_interval,
                         avg_cluster_alignment=cum_metrics.avg_cluster_alignment
                         / log_interval,
+                        avg_n_keys_used=cum_metrics.avg_n_keys_used / log_interval,
                         learning_rate=cum_metrics.learning_rate / log_interval,
                         grad_norm=cum_metrics.grad_norm / log_interval,
                         raw_grad_norm=cum_metrics.raw_grad_norm / log_interval,

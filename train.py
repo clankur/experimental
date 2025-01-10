@@ -542,7 +542,9 @@ class Model:
             # Compute alignments with clusters
             q_alignment = shardops.einsum_unreduced(
                 "B/d Qlen Q K/t D, n_clusters Q K/t D -> B/d Q K/t Qlen n_clusters",
-                lax.stop_gradient(nq),
+                lax.stop_gradient(
+                    nq
+                ),  # TODO: add / jnp.linalg.norm(nq, axis=-1, keepdims=True) back for ln scaling only?
                 q_clusters,
             )
             k_alignment = shardops.einsum_unreduced(
@@ -556,7 +558,6 @@ class Model:
             )  # cluster selected based on alignment to each queryB
             k_to_cluster = jnp.argmax(k_alignment, axis=-1)
             q_cluster_one_hot = jax.nn.one_hot(q_to_cluster, h.n_clusters)
-            k_cluster_one_hot = jax.nn.one_hot(k_to_cluster, h.n_clusters)
             q_alignment_scalar = shardops.einsum_unreduced(
                 "B/d Q K/t Qlen n_clusters, B/d Q K/t Qlen n_clusters -> ",
                 q_alignment,
@@ -572,10 +573,11 @@ class Model:
                 "B Q K Qlen -> B Qlen 1 Q K",
             )
             qk_mask = q_to_cluster == k_to_cluster
-            avg_n_keys_used = jnp.sum(qk_mask, axis=2) / jnp.sum(causal_mask, axis=2)
             # Apply clustering mask using jnp.where
-            att_mask = jnp.where(
-                use_clustering, jnp.logical_and(causal_mask, qk_mask), causal_mask
+            causal_qk_mask = jnp.logical_and(causal_mask, qk_mask)
+            att_mask = jnp.where(use_clustering, causal_qk_mask, causal_mask)
+            avg_n_keys_used = jnp.sum(causal_qk_mask, axis=2) / jnp.sum(
+                causal_mask, axis=2
             )
 
             if h.apply_alibi:
@@ -723,7 +725,10 @@ class Model:
         tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
         ce_loss = -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
         alignment_loss = -(
-            loop_metrics.q_alignment_scalar + loop_metrics.k_alignment_scalar
+            loop_metrics.q_alignment_scalar
+            + loop_metrics.k_alignment_scalar
+            - loop_metrics.avg_q_cluster_alignment
+            # - loop_metrics.avg_k_cluster_alignment
         ) / jnp.float32(tokens_in_global_batch)
         total_loss = ce_loss + alignment_loss
         loop_metrics = replace(loop_metrics, ce_loss=ce_loss)
@@ -897,13 +902,13 @@ def training_step(
             k_alignment_scalar=jax.lax.psum(
                 loop_metrics.k_alignment_scalar, ("d", "t")
             ),
-            avg_q_cluster_alignment=jax.lax.psum(
+            avg_q_cluster_alignment=jax.lax.pmean(
                 loop_metrics.avg_q_cluster_alignment, ("d", "t")
             ),
-            avg_k_cluster_alignment=jax.lax.psum(
+            avg_k_cluster_alignment=jax.lax.pmean(
                 loop_metrics.avg_k_cluster_alignment, ("d", "t")
             ),
-            avg_n_keys_used=jax.lax.psum(loop_metrics.avg_n_keys_used, ("d", "t")),
+            avg_n_keys_used=jax.lax.pmean(loop_metrics.avg_n_keys_used, ("d", "t")),
         )
 
         # Other than global-norm of gradients, no other communication is needed during the weight update,

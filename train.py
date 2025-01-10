@@ -502,61 +502,43 @@ class Model:
 
             # Compute alignments with clusters
             q_alignment = shardops.einsum_unreduced(
-                "B/d L Q K/t D, n_clusters Q K/t D -> B/d Q K/t L n_clusters",
+                "B/d Qlen Q K/t D, n_clusters Q K/t D -> B/d Q K/t Qlen n_clusters",
                 lax.stop_gradient(nq),
                 clusters,
             )
             k_alignment = shardops.einsum_unreduced(
-                "B/d L K/t D, n_clusters Q K/t D -> B/d Q K/t L n_clusters",
+                "B/d Klen K/t D, n_clusters Q K/t D -> B/d Q K/t Klen n_clusters",
                 lax.stop_gradient(nk),
                 clusters,
             )
-            q_to_cluster = jnp.argmax(q_alignment, axis=-1)
+            q_to_cluster = jnp.argmax(q_alignment, axis=-1)  # B/d Q K/t L
             k_to_cluster = jnp.argmax(k_alignment, axis=-1)
-            cluster_q_alignment_mask = einops.rearrange(
-                jax.nn.one_hot(q_to_cluster, h.n_clusters),
-                "B Q K Qlen n_clusters ->  B Q K n_clusters Qlen 1",  # Broadcast to match attention dims
+            q_cluster_one_hot = jax.nn.one_hot(q_to_cluster, h.n_clusters)
+            k_cluster_one_hot = jax.nn.one_hot(k_to_cluster, h.n_clusters)
+            q_alignment_scalar = shardops.einsum_unreduced(
+                "B/d Q K/t Qlen n_clusters, B/d Q K/t Qlen n_clusters -> ",
+                q_alignment,
+                q_cluster_one_hot,
             )
-            cluster_k_alignment_mask = einops.rearrange(
-                jax.nn.one_hot(k_to_cluster, h.n_clusters),
-                "B Q K Klen n_clusters -> B Q K n_clusters Klen 1",  # Broadcast to match attention dims
+            k_alignment_scalar = shardops.einsum_unreduced(
+                "B/d Q K/t Klen n_clusters, B/d Q K/t Klen n_clusters -> ",
+                k_alignment,
+                k_cluster_one_hot,
             )
+            # create mask for qk
             k_to_cluster = einops.rearrange(
                 k_to_cluster,
-                "B Q K Klen -> B Klen 1 Q K",
+                "B Q K Klen -> B 1 Klen Q K",
             )
             q_to_cluster = einops.rearrange(
                 q_to_cluster,
-                "B Q K Qlen -> B 1 Qlen Q K",
+                "B Q K Qlen -> B Qlen 1 Q K",
             )
             qk_mask = q_to_cluster == k_to_cluster
             # Apply clustering mask using jnp.where
             att_mask = jnp.where(
                 use_clustering, jnp.logical_and(causal_mask, qk_mask), causal_mask
             )
-
-            # Select vectors based on cluster assignments
-            q_selected = (
-                einops.rearrange(q, "B Qlen Q K D -> B Q K 1 Qlen D")
-                * cluster_q_alignment_mask
-            )
-            k_selected = (
-                einops.rearrange(k, "B Klen K D -> B 1 K 1 Klen D")
-                * cluster_k_alignment_mask
-            )
-
-            # Compute alignment scalars
-            q_alignment_scalar = einops.reduce(
-                q_selected,
-                "B Q K n_clusters Qlen D -> ",
-                "mean",
-            )
-            k_alignment_scalar = einops.reduce(
-                k_selected,
-                "B Q K n_clusters Klen D -> ",
-                "mean",
-            )
-
 
             if h.apply_alibi:
                 logits = alibi.apply(logits)

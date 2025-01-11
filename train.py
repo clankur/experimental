@@ -103,8 +103,8 @@ class Hparams:
 class LoopMetrics:
     """Metrics for the forward pass. currently placeholders."""
 
-    q_alignment: f32[b""]
-    k_alignment: f32[b""]
+    bias_norm: f32[b""]
+    avg_cum_prob_loaded: f32[b""]
 
 
 def get_parameterization(style: str, fully_aligned: bool = True):
@@ -350,13 +350,8 @@ class Model:
             q_cluster_shape,
             dtype=jnp.float32,
         )
-        q_bias = d_model_scale * jax.random.truncated_normal(
-            fold_in_str(rng, "q_bias"),
-            -2,
-            2,
-            q_cluster_shape[:-1],
-            dtype=jnp.float32,
-        )
+        q_bias = jnp.ones(q_cluster_shape[:-1], dtype=jnp.float32)
+
         k_clusters = d_model_scale * jax.random.truncated_normal(
             fold_in_str(rng, "k_clusters"),
             -2,
@@ -465,15 +460,10 @@ class Model:
                 k = rope_table.apply("L d -> 1 L 1 d", k)
 
             # TODO:
-            # get q_c, k_c using clusters
-            # get logits_c = q_c dot k_c
-            # get probs_c = softmax(logits_c)
-            # turn probs_c into a mask using threshold > 0.5
-            # elementwise multiply probs_c with logits_c
-
             # sigmoid (q_c + bias) # want them to select all the keys => pretty close to 1 at first
             # bias = vector * scale
-            # METRIC: clusters are decaying over time, we can also decay it manually as a function of step
+            # METRIC: track bias decay over time
+            # clusters are decaying over time, we can also decay it manually as a function of step
 
             # future ideas
             # mini objectives along the way
@@ -505,6 +495,7 @@ class Model:
             q_bias = einops.rearrange(
                 layer_weights.q_bias, "n_clusters Q K -> Q K n_clusters"
             )
+            q_bias_norm = jnp.linalg.norm(q_bias, axis=-1)
             q_c = jax.nn.sigmoid(q_c + q_bias)
             k_c = jax.nn.softmax(k_c, axis=2)
 
@@ -530,9 +521,11 @@ class Model:
             if h.apply_alibi:
                 logits = alibi.apply(logits)
 
-            logits = logits * cluster_wei
             logits = jnp.where(causal_mask, logits, -1e10)
             probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
+            logits = logits * cluster_wei
+            avg_cum_prob_loaded = jnp.sum(probs, axis=2).mean()
+
             attn_out = shardops.einsum_unreduced(
                 "B/d Qlen Klen Q K/t, B/d Klen K/t D -> B/d Qlen Q K/t D", probs, v
             )
@@ -579,8 +572,8 @@ class Model:
             ffn_out = shardops.psum_scatter("B/d L M -> B/d L M/t", ffn_out)
 
             return (jnp.bfloat16(x + ffn_out), step, total_steps), LoopMetrics(
-                q_alignment=jnp.float32(0.0),
-                k_alignment=jnp.float32(0.0),
+                avg_cum_prob_loaded=avg_cum_prob_loaded.astype(jnp.float32),
+                bias_norm=q_bias_norm.mean(dtype=jnp.float32),
             )
 
         (x, _, _), loop_metrics = jax.lax.scan(
@@ -589,8 +582,8 @@ class Model:
             self.transformer,
         )
         loop_metrics = LoopMetrics(
-            q_alignment=jnp.sum(loop_metrics.q_alignment),
-            k_alignment=jnp.sum(loop_metrics.k_alignment),
+            avg_cum_prob_loaded=jnp.mean(loop_metrics.avg_cum_prob_loaded),
+            bias_norm=jnp.mean(loop_metrics.bias_norm),
         )
 
         ##### Final layernorm and output projection.
@@ -723,6 +716,8 @@ class Metrics:
     learning_rate: f32[b""]
     grad_norm: f32[b""]
     raw_grad_norm: f32[b""]
+    avg_cum_prob_loaded: f32[b""]
+    bias_norm: f32[b""]
 
 
 @dataclass(frozen=True)
@@ -794,6 +789,12 @@ def training_step(
         #
         # So we reduce the loss across chips _outside_ the autodiff.
         loss = jax.lax.psum(loss, ("d", "t"))
+        loop_metrics = LoopMetrics(
+            avg_cum_prob_loaded=jax.lax.pmean(
+                loop_metrics.avg_cum_prob_loaded, ("d", "t")
+            ),
+            bias_norm=jax.lax.pmean(loop_metrics.bias_norm, ("d", "t")),
+        )
 
         # Other than global-norm of gradients, no other communication is needed during the weight update,
         # because weights and grads are already fully sharded, as checked below.
@@ -910,6 +911,8 @@ def training_step(
             learning_rate=lr,
             grad_norm=global_norm * rescale,
             raw_grad_norm=global_norm,
+            avg_cum_prob_loaded=loop_metrics.avg_cum_prob_loaded,
+            bias_norm=loop_metrics.bias_norm,
         )
         return new_state, metrics
 
@@ -1012,6 +1015,8 @@ def main_contained(config, logger):
             cum_metrics.grad_norm += metrics.grad_norm
             cum_metrics.raw_grad_norm += metrics.raw_grad_norm
             cum_metrics.learning_rate += metrics.learning_rate
+            cum_metrics.avg_cum_prob_loaded += metrics.avg_cum_prob_loaded
+            cum_metrics.bias_norm += metrics.bias_norm
 
         start_time = time.time()
 
@@ -1083,6 +1088,9 @@ def main_contained(config, logger):
                         learning_rate=cum_metrics.learning_rate / log_interval,
                         grad_norm=cum_metrics.grad_norm / log_interval,
                         raw_grad_norm=cum_metrics.raw_grad_norm / log_interval,
+                        avg_cum_prob_loaded=cum_metrics.avg_cum_prob_loaded
+                        / log_interval,
+                        bias_norm=cum_metrics.bias_norm / log_interval,
                     )
                 else:
                     cum_metrics = output

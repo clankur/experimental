@@ -479,9 +479,11 @@ class Model:
                 k,
                 k_clusters,
             )
-            temp = 0.01 + 20 * (jnp.float32(step) / jnp.float32(total_steps))
-            q_c = jax.nn.softmax(q_c * temp, axis=2)
-            k_c = jax.nn.softmax(k_c * temp, axis=2)
+            q_c = jnp.bfloat16(rms_norm(jnp.bfloat16(q_c)))  # B/d L Q K/t D
+            k_c = jnp.bfloat16(rms_norm(jnp.bfloat16(k_c)))
+            # temp = 0.01 + 20 * (jnp.float32(step) / jnp.float32(total_steps))
+            # q_c = jax.nn.softmax(q_c * temp, axis=2)
+            # k_c = jax.nn.softmax(k_c * temp, axis=2)
 
             logits_c = shardops.einsum_unreduced(
                 "B/d Qlen Q K/t n_clusters, B/d Klen K/t n_clusters -> B/d Qlen Klen Q K/t",
@@ -675,7 +677,17 @@ class RopeTable:
 
 
 @typechecked
-def rms_norm(x: bf16[b"batch/d len M"]) -> bf16[b"batch/d len M"]:
+def rms_norm(
+    x: Union[
+        bf16[b"batch/d len M"],
+        bf16[b"B/d L K/t n_clusters"],
+        bf16[b"B/d L Q K/t n_clusters"],
+    ]
+) -> Union[
+    bf16[b"batch/d len M"],
+    bf16[b"B/d L K/t n_clusters"],
+    bf16[b"B/d L Q K/t n_clusters"],
+]:
     mean2 = save_for_backward(
         jnp.mean(jax.lax.square(jnp.float32(x)), axis=-1, keepdims=True)
     )

@@ -74,6 +74,7 @@ class Hparams:
     n_kv: int
     d_head: int
     d_ff: int
+    n_clusters: int
 
     vocab: int
     layers: int
@@ -96,6 +97,12 @@ class Hparams:
     rope_max_timescale: int
     apply_rope: Optional[bool] = True
     apply_alibi: Optional[bool] = False
+
+
+@pytree_dataclass
+class LoopMetrics:
+    q_alignment: f32[b""]
+    k_alignment: f32[b""]
 
 
 def get_parameterization(style: str, fully_aligned: bool = True):
@@ -238,6 +245,8 @@ class TransformerLayer:
     w_gate: f32["d_model/d d_ff/t"]
     w_up: f32["d_model/d d_ff/t"]
     w_down: f32["d_model/d d_ff/t"]
+    q_clusters: f32["n_clusters n_q_per_kv n_kv/t d_head/d"]
+    k_clusters: f32["n_clusters n_kv/t d_head/d"]
 
 
 Transformer = Array["layers", TransformerLayer]
@@ -329,6 +338,22 @@ class Model:
                 (h.vocab, h.d_model),
                 dtype=jnp.float32,
             )
+
+        q_clusters = d_model_scale * jax.random.truncated_normal(
+            fold_in_str(rng, "q_clusters"),
+            -2,
+            2,
+            (h.layers, h.n_clusters, h.n_q_per_kv, h.n_kv, h.d_head),
+            dtype=jnp.float32,
+        )
+        k_clusters = d_model_scale * jax.random.truncated_normal(
+            fold_in_str(rng, "k_clusters"),
+            -2,
+            2,
+            (h.layers, h.n_clusters, h.n_kv, h.d_head),
+            dtype=jnp.float32,
+        )
+
         arrays = Model(
             embed=embed,
             unembed=unembed,
@@ -341,6 +366,8 @@ class Model:
                 w_gate=w_gate,
                 w_up=w_up,
                 w_down=w_down,
+                q_clusters=q_clusters,
+                k_clusters=k_clusters,
             ),
             final_layer_norm=final_layer_norm,
         )
@@ -350,7 +377,7 @@ class Model:
     @typechecked
     def forward_pass(
         self, h: Hparams, ids: u32[b"B/d L"], is_seq_start: bool_[b"B/d L"]
-    ) -> f32[b"B/d L V/t"]:
+    ) -> Tuple[f32[b"B/d L V/t"], LoopMetrics]:
         p = get_parameterization(h.parameterization)
         embed_mult = (h.d_model / h.base.d_model) ** -p.embed_param_mult
         hidden_mult = (h.d_model / h.base.d_model) ** -p.hidden_param_mult
@@ -388,7 +415,7 @@ class Model:
         @typechecked
         def loop_body(
             x: bf16[b"B/d L M/t"], layer_weights: TransformerLayer
-        ) -> Tuple[bf16[b"B/d L M/t"], Tuple[()]]:
+        ) -> Tuple[bf16[b"B/d L M/t"], LoopMetrics]:
             # Pre-attention RMSNorm
             ln1 = shardops.all_gather("M/t/d -> M", jnp.float32(layer_weights.ln1))
             gx = shardops.all_gather("B/d L M/t -> B/d L M", x)
@@ -418,6 +445,40 @@ class Model:
             if h.apply_rope:
                 k = rope_table.apply("L d -> 1 L 1 d", k)
 
+            # TODO:
+            # get q_c, k_c using clusters
+            # get logits_c = q_c dot k_c
+            # get probs_c = softmax(logits_c)
+            # turn probs_c into a mask using threshold > 0.5
+            # elementwise multiply probs_c with logits_c
+            q_clusters = shardops.all_gather(
+                "n_clusters Q K/t D/d -> n_clusters Q K/t D",
+                layer_weights.q_clusters,
+            )
+            k_clusters = shardops.all_gather(
+                "n_clusters K/t D/d -> n_clusters K/t D", layer_weights.k_clusters
+            )
+
+            q_c = shardops.einsum_unreduced(
+                "B/d L Q K/t D, n_clusters Q K/t D -> B/d L Q K/t n_clusters",
+                q,
+                q_clusters,
+            )
+
+            k_c = shardops.einsum_unreduced(
+                "B/d L K/t D, n_clusters K/t D -> B/d L K/t n_clusters",
+                k,
+                k_clusters,
+            )
+
+            logits_c = shardops.einsum_unreduced(
+                "B/d Qlen Q K/t n_clusters, B/d Klen K/t n_clusters -> B/d Qlen Klen Q K/t",
+                q_c,
+                k_c,
+            ) / math.sqrt(h.n_clusters)
+            logits_c = jnp.where(causal_mask, logits_c, -1e10)
+            cluster_mask = jax.nn.softmax(logits_c, axis=2) > 0.5
+
             logit_scale = jax.lax.select(
                 h.parameterization.lower() == "mup",
                 h.a_attn * math.sqrt(h.base.d_head) / h.d_head,
@@ -431,7 +492,9 @@ class Model:
             )
             if h.apply_alibi:
                 logits = alibi.apply(logits)
-            logits = jnp.where(causal_mask, logits, -1e10)
+
+            att_mask = jnp.logical_and(causal_mask, cluster_mask)
+            logits = jnp.where(att_mask, logits, -1e10)
             probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
             attn_out = shardops.einsum_unreduced(
                 "B/d Qlen Klen Q K/t, B/d Klen K/t D -> B/d Qlen Q K/t D", probs, v
@@ -478,9 +541,16 @@ class Model:
             )
             ffn_out = shardops.psum_scatter("B/d L M -> B/d L M/t", ffn_out)
 
-            return jnp.bfloat16(x + ffn_out), ()
+            return jnp.bfloat16(x + ffn_out), LoopMetrics(
+                q_alignment=jnp.float32(0.0),
+                k_alignment=jnp.float32(0.0),
+            )
 
-        x, () = jax.lax.scan(loop_body, jnp.bfloat16(x), self.transformer)
+        x, loop_metrics = jax.lax.scan(loop_body, jnp.bfloat16(x), self.transformer)
+        loop_metrics = LoopMetrics(
+            q_alignment=jnp.sum(loop_metrics.q_alignment),
+            k_alignment=jnp.sum(loop_metrics.k_alignment),
+        )
 
         ##### Final layernorm and output projection.
         x = shardops.all_gather("B/d L M/t -> B/d L M", x)
@@ -496,10 +566,10 @@ class Model:
             preferred_element_type=jnp.float32,
         )
 
-        return logits
+        return logits, loop_metrics
 
     @typechecked
-    def loss(self, h: Hparams, batch: TokenBatch) -> f32[b""]:
+    def loss(self, h: Hparams, batch: TokenBatch) -> Tuple[f32[b""], LoopMetrics]:
         # Given sequence-packed targets:
         #   [[1, 2], [3, 4, 5], [6, 7, 8, 9]]
         # we want inputs:
@@ -510,7 +580,7 @@ class Model:
         is_seq_start: bool_[b"batch/d len"] = batch.is_seq_start
         inputs: u32[b"batch/d len"] = jnp.where(is_seq_start, 0, inputs)
 
-        logits: f32[b"batch/d len V/t"] = self.forward_pass(h, inputs, is_seq_start)
+        logits, loop_metrics = self.forward_pass(h, inputs, is_seq_start)
         max_logits: f32[b"batch/d len 1"] = lax.pmax(
             jnp.max(lax.stop_gradient(logits), axis=-1, keepdims=True), "t"
         )
@@ -525,7 +595,10 @@ class Model:
             "batch/d len -> batch/d len/t", logprobs_at_targets
         )
         tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
-        return -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
+        return (
+            -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch),
+            loop_metrics,
+        )
 
 
 @pytree_dataclass
@@ -647,9 +720,15 @@ def training_step(
     def sharded_step(
         state: State, step: u32[b""], batch: TokenBatch
     ) -> Tuple[State, Metrics]:
-        loss, grad = jax.value_and_grad(lambda weights: weights.loss(h, batch))(
-            state.weights
-        )
+        (
+            (
+                loss,
+                loop_metrics,
+            ),
+            grad,
+        ) = jax.value_and_grad(
+            lambda weights: weights.loss(h, batch), has_aux=True
+        )(state.weights)
         # Gradients have already been reduced across chips because the gradient of the weight `all_gather`
         # is weight-gradient `psum_scatter`. Loss, on the other hand, hasn't been reduced across chips: if we
         # did that inside the autodiff, we'd be double-reducing the loss, effectively multiplying it by the
@@ -709,6 +788,8 @@ def training_step(
                 w_gate=h.gamma_hidden * (h.d_model / base.d_model) ** -p.hidden_lr,
                 w_up=h.gamma_hidden * (h.d_model / base.d_model) ** -p.hidden_lr,
                 w_down=h.gamma_hidden * (h.d_ff / base.d_ff) ** -p.hidden_lr,
+                q_clusters=1.0,
+                k_clusters=1.0,
             ),
             final_layer_norm=1.0,
         )

@@ -249,6 +249,7 @@ class TransformerLayer:
     w_down: f32["d_model/d d_ff/t"]
     q_clusters: f32["n_clusters n_q_per_kv n_kv/t d_head/d"]
     k_clusters: f32["n_clusters n_kv/t d_head/d"]
+    q_bias: f32["n_clusters n_q_per_kv n_kv/t"]
 
 
 Transformer = Array["layers", TransformerLayer]
@@ -341,11 +342,19 @@ class Model:
                 dtype=jnp.float32,
             )
 
+        q_cluster_shape = (h.layers, h.n_clusters, h.n_q_per_kv, h.n_kv, h.d_head)
         q_clusters = d_model_scale * jax.random.truncated_normal(
             fold_in_str(rng, "q_clusters"),
             -2,
             2,
-            (h.layers, h.n_clusters, h.n_q_per_kv, h.n_kv, h.d_head),
+            q_cluster_shape,
+            dtype=jnp.float32,
+        )
+        q_bias = d_model_scale * jax.random.truncated_normal(
+            fold_in_str(rng, "q_bias"),
+            -2,
+            2,
+            q_cluster_shape[:-1],
             dtype=jnp.float32,
         )
         k_clusters = d_model_scale * jax.random.truncated_normal(
@@ -370,6 +379,7 @@ class Model:
                 w_down=w_down,
                 q_clusters=q_clusters,
                 k_clusters=k_clusters,
+                q_bias=q_bias,
             ),
             final_layer_norm=final_layer_norm,
         )
@@ -460,6 +470,16 @@ class Model:
             # get probs_c = softmax(logits_c)
             # turn probs_c into a mask using threshold > 0.5
             # elementwise multiply probs_c with logits_c
+
+            # sigmoid (q_c + bias) # want them to select all the keys => pretty close to 1 at first
+            # bias = vector * scale
+            # METRIC: clusters are decaying over time, we can also decay it manually as a function of step
+
+            # future ideas
+            # mini objectives along the way
+            # have a loss based on based on the total probabilites from the loaded clusters
+            # METRIC: average cum prob loaded
+
             q_clusters = shardops.all_gather(
                 "n_clusters Q K/t D/d -> n_clusters Q K/t D",
                 layer_weights.q_clusters,
@@ -482,8 +502,11 @@ class Model:
             q_c = jnp.bfloat16(rms_norm(jnp.bfloat16(q_c)))  # B/d L Q K/t D
             k_c = jnp.bfloat16(rms_norm(jnp.bfloat16(k_c)))
             # temp = 0.01 + 20 * (jnp.float32(step) / jnp.float32(total_steps))
-            # q_c = jax.nn.softmax(q_c * temp, axis=2)
-            # k_c = jax.nn.softmax(k_c * temp, axis=2)
+            q_bias = einops.rearrange(
+                layer_weights.q_bias, "n_clusters Q K -> Q K n_clusters"
+            )
+            q_c = jax.nn.sigmoid(q_c + q_bias)
+            k_c = jax.nn.softmax(k_c, axis=2)
 
             logits_c = shardops.einsum_unreduced(
                 "B/d Qlen Q K/t n_clusters, B/d Klen K/t n_clusters -> B/d Qlen Klen Q K/t",
@@ -795,6 +818,12 @@ def training_step(
 
         # AdamW optimizer with global gradient clipping.
         grad_leaves, grad_treedef = jax.tree_util.tree_flatten(grad)
+        grad_leaves = [
+            shardops.pmean_across_replicas(pspec, g)
+            for g, pspec in zip(
+                grad_leaves, tree_leaves(shardtypes.make_partition_specs(State))
+            )
+        ]
         global_norm_square = jnp.float32(0.0)
         for g in grad_leaves:
             assert g.dtype == jnp.float32
@@ -825,6 +854,7 @@ def training_step(
                 w_down=h.gamma_hidden * (h.d_ff / base.d_ff) ** -p.hidden_lr,
                 q_clusters=1.0,
                 k_clusters=1.0,
+                q_bias=1.0,
             ),
             final_layer_norm=1.0,
         )
@@ -846,9 +876,6 @@ def training_step(
             tree_leaves(shardtypes.make_partition_specs(State)),
             tree_leaves(lr_scales),
         ):
-            assert shardtypes.is_fully_sharded(
-                spec
-            ), "Weight update is only correctly scaled for fully sharded weights."
             # Gradient clipping
             g = g * rescale
             # Adam scaling

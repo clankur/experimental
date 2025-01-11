@@ -101,6 +101,8 @@ class Hparams:
 
 @pytree_dataclass
 class LoopMetrics:
+    """Metrics for the forward pass. currently placeholders."""
+
     q_alignment: f32[b""]
     k_alignment: f32[b""]
 
@@ -376,7 +378,12 @@ class Model:
 
     @typechecked
     def forward_pass(
-        self, h: Hparams, ids: u32[b"B/d L"], is_seq_start: bool_[b"B/d L"]
+        self,
+        h: Hparams,
+        ids: u32[b"B/d L"],
+        is_seq_start: bool_[b"B/d L"],
+        step: u32[b""],
+        total_steps: u32[b""],
     ) -> Tuple[f32[b"B/d L V/t"], LoopMetrics]:
         p = get_parameterization(h.parameterization)
         embed_mult = (h.d_model / h.base.d_model) ** -p.embed_param_mult
@@ -414,8 +421,10 @@ class Model:
         @explicit_activation_checkpointing
         @typechecked
         def loop_body(
-            x: bf16[b"B/d L M/t"], layer_weights: TransformerLayer
-        ) -> Tuple[bf16[b"B/d L M/t"], LoopMetrics]:
+            carry: Tuple[bf16[b"B/d L M/t"], u32[b""], u32[b""]],
+            layer_weights: TransformerLayer,
+        ) -> Tuple[Tuple[bf16[b"B/d L M/t"], u32[b""], u32[b""]], LoopMetrics]:
+            x, step, total_steps = carry
             # Pre-attention RMSNorm
             ln1 = shardops.all_gather("M/t/d -> M", jnp.float32(layer_weights.ln1))
             gx = shardops.all_gather("B/d L M/t -> B/d L M", x)
@@ -470,6 +479,9 @@ class Model:
                 k,
                 k_clusters,
             )
+            temp = 0.01 + 20 * (jnp.float32(step) / jnp.float32(total_steps))
+            q_c = jax.nn.softmax(q_c * temp, axis=2)
+            k_c = jax.nn.softmax(k_c * temp, axis=2)
 
             logits_c = shardops.einsum_unreduced(
                 "B/d Qlen Q K/t n_clusters, B/d Klen K/t n_clusters -> B/d Qlen Klen Q K/t",
@@ -477,7 +489,7 @@ class Model:
                 k_c,
             ) / math.sqrt(h.n_clusters)
             logits_c = jnp.where(causal_mask, logits_c, -1e10)
-            cluster_mask = jax.nn.softmax(logits_c, axis=2) > 0.5
+            cluster_wei = jax.nn.softmax(logits_c, axis=2)
 
             logit_scale = jax.lax.select(
                 h.parameterization.lower() == "mup",
@@ -493,8 +505,8 @@ class Model:
             if h.apply_alibi:
                 logits = alibi.apply(logits)
 
-            att_mask = jnp.logical_and(causal_mask, cluster_mask)
-            logits = jnp.where(att_mask, logits, -1e10)
+            logits = logits * cluster_wei
+            logits = jnp.where(causal_mask, logits, -1e10)
             probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
             attn_out = shardops.einsum_unreduced(
                 "B/d Qlen Klen Q K/t, B/d Klen K/t D -> B/d Qlen Q K/t D", probs, v
@@ -541,12 +553,16 @@ class Model:
             )
             ffn_out = shardops.psum_scatter("B/d L M -> B/d L M/t", ffn_out)
 
-            return jnp.bfloat16(x + ffn_out), LoopMetrics(
+            return (jnp.bfloat16(x + ffn_out), step, total_steps), LoopMetrics(
                 q_alignment=jnp.float32(0.0),
                 k_alignment=jnp.float32(0.0),
             )
 
-        x, loop_metrics = jax.lax.scan(loop_body, jnp.bfloat16(x), self.transformer)
+        (x, _, _), loop_metrics = jax.lax.scan(
+            loop_body,
+            (jnp.bfloat16(x), step, total_steps),
+            self.transformer,
+        )
         loop_metrics = LoopMetrics(
             q_alignment=jnp.sum(loop_metrics.q_alignment),
             k_alignment=jnp.sum(loop_metrics.k_alignment),
@@ -569,7 +585,9 @@ class Model:
         return logits, loop_metrics
 
     @typechecked
-    def loss(self, h: Hparams, batch: TokenBatch) -> Tuple[f32[b""], LoopMetrics]:
+    def loss(
+        self, h: Hparams, batch: TokenBatch, step: u32[b""], total_steps: u32[b""]
+    ) -> Tuple[f32[b""], LoopMetrics]:
         # Given sequence-packed targets:
         #   [[1, 2], [3, 4, 5], [6, 7, 8, 9]]
         # we want inputs:
@@ -580,7 +598,9 @@ class Model:
         is_seq_start: bool_[b"batch/d len"] = batch.is_seq_start
         inputs: u32[b"batch/d len"] = jnp.where(is_seq_start, 0, inputs)
 
-        logits, loop_metrics = self.forward_pass(h, inputs, is_seq_start)
+        logits, loop_metrics = self.forward_pass(
+            h, inputs, is_seq_start, step, total_steps
+        )
         max_logits: f32[b"batch/d len 1"] = lax.pmax(
             jnp.max(lax.stop_gradient(logits), axis=-1, keepdims=True), "t"
         )
@@ -727,7 +747,10 @@ def training_step(
             ),
             grad,
         ) = jax.value_and_grad(
-            lambda weights: weights.loss(h, batch), has_aux=True
+            lambda weights: weights.loss(
+                h, batch, jnp.uint32(step), jnp.uint32(hparams.steps)
+            ),
+            has_aux=True,
         )(state.weights)
         # Gradients have already been reduced across chips because the gradient of the weight `all_gather`
         # is weight-gradient `psum_scatter`. Loss, on the other hand, hasn't been reduced across chips: if we

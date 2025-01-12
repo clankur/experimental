@@ -470,6 +470,8 @@ class Model:
             # have a loss based on based on the total probabilites from the loaded clusters
             # METRIC: average cum prob loaded
 
+            # loss to penalize a cluster that is useless
+
             q_clusters = shardops.all_gather(
                 "n_clusters Q K/t D/d -> n_clusters Q K/t D",
                 layer_weights.q_clusters,
@@ -506,6 +508,7 @@ class Model:
             ) / math.sqrt(h.n_clusters)
             logits_c = jnp.where(causal_mask, logits_c, -1e10)
             cluster_wei = jax.nn.softmax(logits_c, axis=2)
+            # eval the prob of cluster_wei
 
             logit_scale = jax.lax.select(
                 h.parameterization.lower() == "mup",
@@ -522,10 +525,10 @@ class Model:
                 logits = alibi.apply(logits)
 
             logits = jnp.where(causal_mask, logits, -1e10)
-            probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
-            logits = logits * cluster_wei
+            probs = jax.nn.softmax(logits, axis=2)
+            probs = jnp.bfloat16(probs * cluster_wei)
             avg_cum_prob_loaded = jnp.sum(probs, axis=2).mean()
-
+            # want a loss based on prob per token loaded, total_prob/total_tokens_loaded, if below threshold drop it
             attn_out = shardops.einsum_unreduced(
                 "B/d Qlen Klen Q K/t, B/d Klen K/t D -> B/d Qlen Q K/t D", probs, v
             )

@@ -355,6 +355,19 @@ def make_partition_specs(cls):
     args = typing.get_args(cls)
     if origin is tuple:
         return tuple(make_partition_specs(arg) for arg in args)
+    elif origin is dict:
+
+        assert (
+            args[0] is str
+        ), f"make_partition_specs for dict type: Only allowing `str` keys, but got {args[0]}"
+        p_leaves, _ = jax.tree_util.tree_flatten(make_partition_specs(args[1]))
+        p_set = set(p_leaves)
+        fully_replicated = jax.sharding.PartitionSpec()
+        assert (
+            len(p_set) == 1 and p_set.pop() == fully_replicated
+        ), f"make_partition_specs for dict type: Only allowing fully replicated scalars as values, but got {args[1]}"
+        return fully_replicated
+
     elif origin is not None and issubclass(origin, number):
         if len(args) != 1 or (type(args[0]) is not str and type(args[0]) is not bytes):
             raise ValueError(

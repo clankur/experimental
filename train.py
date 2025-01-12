@@ -17,7 +17,7 @@ import gcsfs  # Needed for clearml setup
 
 import datetime
 from functools import cached_property, partial
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Optional, Tuple, Union, Dict
 import hydra
 from typeguard import typechecked
 from dataclasses import dataclass, replace
@@ -100,11 +100,41 @@ class Hparams:
 
 
 @pytree_dataclass
-class LoopMetrics:
+class GlobalStats:
+    max: f32[b""]
+    min: f32[b""]
+    mean: f32[b""]
+    std: f32[b""]
+    abs_max: f32[b""]
+    abs_mean: f32[b""]
+
+
+# TODO: add per layer stats
+# TODO: add per head stats
+
+
+# Add stats function
+# loop metrics is just a dict of stats
+# precision: retrieval mask - use a threshold for the queries
+
+
+def get_stats(x: Union[f32[b"B/d Qlen Klen Q K/t"]]) -> GlobalStats:
+
+    return GlobalStats(
+        max=jnp.max(x),
+        min=jnp.min(x),
+        mean=jnp.mean(x),
+        std=jnp.std(x),
+        abs_max=jnp.max(jnp.abs(x)),
+        abs_mean=jnp.mean(jnp.abs(x)),
+    )
+
+
+@pytree_dataclass
+class StatsDict:
     """Metrics for the forward pass. currently placeholders."""
 
-    bias_norm: f32[b""]
-    avg_cluster_recall: f32[b""]
+    stats: Dict[str, GlobalStats]
     ce_loss: f32[b""]
 
 
@@ -390,7 +420,7 @@ class Model:
         is_seq_start: bool_[b"B/d L"],
         step: u32[b""],
         total_steps: u32[b""],
-    ) -> Tuple[f32[b"B/d L V/t"], LoopMetrics]:
+    ) -> Tuple[f32[b"B/d L V/t"], StatsDict]:
         p = get_parameterization(h.parameterization)
         embed_mult = (h.d_model / h.base.d_model) ** -p.embed_param_mult
         hidden_mult = (h.d_model / h.base.d_model) ** -p.hidden_param_mult
@@ -429,7 +459,8 @@ class Model:
         def loop_body(
             carry: Tuple[bf16[b"B/d L M/t"], u32[b""], u32[b""]],
             layer_weights: TransformerLayer,
-        ) -> Tuple[Tuple[bf16[b"B/d L M/t"], u32[b""], u32[b""]], LoopMetrics]:
+        ) -> Tuple[Tuple[bf16[b"B/d L M/t"], u32[b""], u32[b""]], StatsDict]:
+            stats = {}
             x, step, total_steps = carry
             # Pre-attention RMSNorm
             ln1 = shardops.all_gather("M/t/d -> M", jnp.float32(layer_weights.ln1))
@@ -502,6 +533,8 @@ class Model:
             q_c = jax.nn.sigmoid(q_c)
             k_c = jax.nn.softmax(k_c, axis=2)
             # report q_c average to metrics
+            stats["q_c"] = get_stats(q_c)
+
             logits_c = shardops.einsum_unreduced(
                 "B/d Qlen Q K/t n_clusters, B/d Klen K/t n_clusters -> B/d Qlen Klen Q K/t",
                 q_c,
@@ -526,10 +559,14 @@ class Model:
 
             logits = jnp.where(causal_mask, logits, -1e10)
             probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
+            stats["probs"] = get_stats(probs)
             # create a softmask
-            avg_cluster_recall = jnp.sum(
-                jax.lax.stop_gradient(probs) * cluster_wei, axis=2
-            ).mean()
+            stats["cluster_recall"] = get_stats(
+                jax.lax.stop_gradient(probs) * cluster_wei
+            )
+            # check if probs sum greater > 1, log total prob of each query
+            # max value of cluster_wei, max and mean of (abs(cluster_wei))
+
             # want a loss based on prob per token loaded, total_prob/total_tokens_loaded, if below threshold drop it
             # get a one hot coding, sum along a cluster index
             # get a loss based on prob per token loaded, total_prob/total_tokens_loaded, if below threshold drop it
@@ -578,22 +615,26 @@ class Model:
             )
             ffn_out = shardops.psum_scatter("B/d L M -> B/d L M/t", ffn_out)
 
-            return (jnp.bfloat16(x + ffn_out), step, total_steps), LoopMetrics(
-                avg_cluster_recall=avg_cluster_recall.astype(jnp.float32),
-                bias_norm=q_bias_norm.mean(dtype=jnp.float32),
-                ce_loss=jnp.float32(0.0),
+            return (jnp.bfloat16(x + ffn_out), step, total_steps), StatsDict(
+                stats=stats, ce_loss=jnp.float32(0.0)
             )
 
-        (x, _, _), loop_metrics = jax.lax.scan(
+        (x, _, _), layer_stats = jax.lax.scan(
             loop_body,
             (jnp.bfloat16(x), step, total_steps),
             self.transformer,
         )
-        loop_metrics = LoopMetrics(
-            avg_cluster_recall=jnp.mean(loop_metrics.avg_cluster_recall),
-            bias_norm=jnp.mean(loop_metrics.bias_norm),
-            ce_loss=jnp.float32(0.0),
-        )
+        global_stats = {
+            key: GlobalStats(
+                max=jnp.max(value.max),
+                min=jnp.min(value.min),
+                mean=jnp.mean(value.mean),
+                std=jnp.std(value.std),
+                abs_max=jnp.max(value.abs_max),
+                abs_mean=jnp.mean(value.abs_mean),
+            )
+            for key, value in layer_stats.stats.items()
+        }
 
         ##### Final layernorm and output projection.
         x = shardops.all_gather("B/d L M/t -> B/d L M", x)
@@ -609,12 +650,12 @@ class Model:
             preferred_element_type=jnp.float32,
         )
 
-        return logits, loop_metrics
+        return logits, StatsDict(stats=global_stats, ce_loss=jnp.float32(0.0))
 
     @typechecked
     def loss(
         self, h: Hparams, batch: TokenBatch, step: u32[b""], total_steps: u32[b""]
-    ) -> Tuple[f32[b""], LoopMetrics]:
+    ) -> Tuple[f32[b""], StatsDict]:
         # Given sequence-packed targets:
         #   [[1, 2], [3, 4, 5], [6, 7, 8, 9]]
         # we want inputs:
@@ -625,7 +666,7 @@ class Model:
         is_seq_start: bool_[b"batch/d len"] = batch.is_seq_start
         inputs: u32[b"batch/d len"] = jnp.where(is_seq_start, 0, inputs)
 
-        logits, loop_metrics = self.forward_pass(
+        logits, stats_dict = self.forward_pass(
             h, inputs, is_seq_start, step, total_steps
         )
         max_logits: f32[b"batch/d len 1"] = lax.pmax(
@@ -643,12 +684,11 @@ class Model:
         )
         tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
         ce_loss = -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
-        recall_loss = -loop_metrics.avg_cluster_recall
+        recall_loss = -stats_dict.stats["cluster_recall"].mean
         total_loss = ce_loss + recall_loss
-        loop_metrics = replace(loop_metrics, ce_loss=ce_loss)
         return (
             total_loss,
-            loop_metrics,
+            StatsDict(stats=stats_dict.stats, ce_loss=ce_loss),
         )
 
 
@@ -729,8 +769,6 @@ class Metrics:
     learning_rate: f32[b""]
     grad_norm: f32[b""]
     raw_grad_norm: f32[b""]
-    avg_cluster_recall: f32[b""]
-    bias_norm: f32[b""]
     total_loss: f32[b""]
 
 
@@ -787,7 +825,7 @@ def training_step(
         (
             (
                 loss,
-                loop_metrics,
+                stats_dict,
             ),
             grad,
         ) = jax.value_and_grad(
@@ -803,13 +841,8 @@ def training_step(
         #
         # So we reduce the loss across chips _outside_ the autodiff.
         loss = jax.lax.psum(loss, ("d", "t"))
-        loop_metrics = LoopMetrics(
-            avg_cluster_recall=jax.lax.pmean(
-                loop_metrics.avg_cluster_recall, ("d", "t")
-            ),
-            bias_norm=jax.lax.pmean(loop_metrics.bias_norm, ("d", "t")),
-            ce_loss=jax.lax.psum(loop_metrics.ce_loss, ("d", "t")),
-        )
+        for key, value in stats_dict.stats.items():
+            stats_dict.stats[key] = jax.lax.pmean(value, ("d", "t"))
 
         # Other than global-norm of gradients, no other communication is needed during the weight update,
         # because weights and grads are already fully sharded, as checked below.
@@ -924,12 +957,10 @@ def training_step(
             adam_nu=jax.tree_util.tree_unflatten(grad_treedef, new_nus),
         )
         metrics = Metrics(
-            loss=loop_metrics.ce_loss,
+            loss=stats_dict.ce_loss,
             learning_rate=lr,
             grad_norm=global_norm * rescale,
             raw_grad_norm=global_norm,
-            avg_cluster_recall=loop_metrics.avg_cluster_recall,
-            bias_norm=loop_metrics.bias_norm,
             total_loss=loss,
         )
         return new_state, metrics
@@ -1033,8 +1064,6 @@ def main_contained(config, logger):
             cum_metrics.grad_norm += metrics.grad_norm
             cum_metrics.raw_grad_norm += metrics.raw_grad_norm
             cum_metrics.learning_rate += metrics.learning_rate
-            cum_metrics.avg_cluster_recall += metrics.avg_cluster_recall
-            cum_metrics.bias_norm += metrics.bias_norm
             cum_metrics.total_loss += metrics.total_loss
 
         start_time = time.time()
@@ -1107,9 +1136,6 @@ def main_contained(config, logger):
                         learning_rate=cum_metrics.learning_rate / log_interval,
                         grad_norm=cum_metrics.grad_norm / log_interval,
                         raw_grad_norm=cum_metrics.raw_grad_norm / log_interval,
-                        avg_cluster_recall=cum_metrics.avg_cluster_recall
-                        / log_interval,
-                        bias_norm=cum_metrics.bias_norm / log_interval,
                         total_loss=cum_metrics.total_loss / log_interval,
                     )
                 else:

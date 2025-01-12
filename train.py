@@ -104,7 +104,8 @@ class LoopMetrics:
     """Metrics for the forward pass. currently placeholders."""
 
     bias_norm: f32[b""]
-    avg_cum_prob_loaded: f32[b""]
+    avg_cluster_recall: f32[b""]
+    ce_loss: f32[b""]
 
 
 def get_parameterization(style: str, fully_aligned: bool = True):
@@ -479,35 +480,34 @@ class Model:
             k_clusters = shardops.all_gather(
                 "n_clusters K/t D/d -> n_clusters K/t D", layer_weights.k_clusters
             )
+            nq = jnp.bfloat16(rms_norm(jnp.bfloat16(q)))
+            nk = jnp.bfloat16(rms_norm(jnp.bfloat16(k)))
 
             q_c = shardops.einsum_unreduced(
                 "B/d L Q K/t D, n_clusters Q K/t D -> B/d L Q K/t n_clusters",
-                q,
+                jax.lax.stop_gradient(nq),
                 q_clusters,
             )
 
             k_c = shardops.einsum_unreduced(
                 "B/d L K/t D, n_clusters K/t D -> B/d L K/t n_clusters",
-                k,
+                jax.lax.stop_gradient(nk),
                 k_clusters,
             )
-            q_c = jnp.bfloat16(rms_norm(jnp.bfloat16(q_c)))  # B/d L Q K/t D
-            k_c = jnp.bfloat16(rms_norm(jnp.bfloat16(k_c)))
             # temp = 0.01 + 20 * (jnp.float32(step) / jnp.float32(total_steps))
             q_bias = einops.rearrange(
                 layer_weights.q_bias, "n_clusters Q K -> Q K n_clusters"
             )
             q_bias_norm = jnp.linalg.norm(q_bias, axis=-1)
-            q_c = jax.nn.sigmoid(q_c + q_bias)
+            q_c = jax.nn.sigmoid(q_c)
             k_c = jax.nn.softmax(k_c, axis=2)
-
+            # report q_c average to metrics
             logits_c = shardops.einsum_unreduced(
                 "B/d Qlen Q K/t n_clusters, B/d Klen K/t n_clusters -> B/d Qlen Klen Q K/t",
                 q_c,
                 k_c,
             ) / math.sqrt(h.n_clusters)
-            logits_c = jnp.where(causal_mask, logits_c, -1e10)
-            cluster_wei = jax.nn.softmax(logits_c, axis=2)
+            cluster_wei = jnp.where(causal_mask, logits_c, -1e10)
             # eval the prob of cluster_wei
 
             logit_scale = jax.lax.select(
@@ -525,10 +525,14 @@ class Model:
                 logits = alibi.apply(logits)
 
             logits = jnp.where(causal_mask, logits, -1e10)
-            probs = jax.nn.softmax(logits, axis=2)
-            probs = jnp.bfloat16(probs * cluster_wei)
-            avg_cum_prob_loaded = jnp.sum(probs, axis=2).mean()
+            probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
+            # create a softmask
+            avg_cluster_recall = jnp.sum(
+                jax.lax.stop_gradient(probs) * cluster_wei, axis=2
+            ).mean()
             # want a loss based on prob per token loaded, total_prob/total_tokens_loaded, if below threshold drop it
+            # get a one hot coding, sum along a cluster index
+            # get a loss based on prob per token loaded, total_prob/total_tokens_loaded, if below threshold drop it
             attn_out = shardops.einsum_unreduced(
                 "B/d Qlen Klen Q K/t, B/d Klen K/t D -> B/d Qlen Q K/t D", probs, v
             )
@@ -575,8 +579,9 @@ class Model:
             ffn_out = shardops.psum_scatter("B/d L M -> B/d L M/t", ffn_out)
 
             return (jnp.bfloat16(x + ffn_out), step, total_steps), LoopMetrics(
-                avg_cum_prob_loaded=avg_cum_prob_loaded.astype(jnp.float32),
+                avg_cluster_recall=avg_cluster_recall.astype(jnp.float32),
                 bias_norm=q_bias_norm.mean(dtype=jnp.float32),
+                ce_loss=jnp.float32(0.0),
             )
 
         (x, _, _), loop_metrics = jax.lax.scan(
@@ -585,8 +590,9 @@ class Model:
             self.transformer,
         )
         loop_metrics = LoopMetrics(
-            avg_cum_prob_loaded=jnp.mean(loop_metrics.avg_cum_prob_loaded),
+            avg_cluster_recall=jnp.mean(loop_metrics.avg_cluster_recall),
             bias_norm=jnp.mean(loop_metrics.bias_norm),
+            ce_loss=jnp.float32(0.0),
         )
 
         ##### Final layernorm and output projection.
@@ -636,8 +642,12 @@ class Model:
             "batch/d len -> batch/d len/t", logprobs_at_targets
         )
         tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
+        ce_loss = -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
+        recall_loss = -loop_metrics.avg_cluster_recall
+        total_loss = ce_loss + recall_loss
+        loop_metrics = replace(loop_metrics, ce_loss=ce_loss)
         return (
-            -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch),
+            total_loss,
             loop_metrics,
         )
 
@@ -699,13 +709,13 @@ class RopeTable:
 def rms_norm(
     x: Union[
         bf16[b"batch/d len M"],
-        bf16[b"B/d L K/t n_clusters"],
-        bf16[b"B/d L Q K/t n_clusters"],
+        bf16[b"B/d L K/t D"],
+        bf16[b"B/d L Q K/t D"],
     ]
 ) -> Union[
     bf16[b"batch/d len M"],
-    bf16[b"B/d L K/t n_clusters"],
-    bf16[b"B/d L Q K/t n_clusters"],
+    bf16[b"B/d L K/t D"],
+    bf16[b"B/d L Q K/t D"],
 ]:
     mean2 = save_for_backward(
         jnp.mean(jax.lax.square(jnp.float32(x)), axis=-1, keepdims=True)
@@ -719,8 +729,9 @@ class Metrics:
     learning_rate: f32[b""]
     grad_norm: f32[b""]
     raw_grad_norm: f32[b""]
-    avg_cum_prob_loaded: f32[b""]
+    avg_cluster_recall: f32[b""]
     bias_norm: f32[b""]
+    total_loss: f32[b""]
 
 
 @dataclass(frozen=True)
@@ -793,10 +804,11 @@ def training_step(
         # So we reduce the loss across chips _outside_ the autodiff.
         loss = jax.lax.psum(loss, ("d", "t"))
         loop_metrics = LoopMetrics(
-            avg_cum_prob_loaded=jax.lax.pmean(
-                loop_metrics.avg_cum_prob_loaded, ("d", "t")
+            avg_cluster_recall=jax.lax.pmean(
+                loop_metrics.avg_cluster_recall, ("d", "t")
             ),
             bias_norm=jax.lax.pmean(loop_metrics.bias_norm, ("d", "t")),
+            ce_loss=jax.lax.psum(loop_metrics.ce_loss, ("d", "t")),
         )
 
         # Other than global-norm of gradients, no other communication is needed during the weight update,
@@ -829,7 +841,9 @@ def training_step(
             )
         ]
         global_norm_square = jnp.float32(0.0)
-        for g in grad_leaves:
+        for key, g in vars(grad.transformer).items():
+            if "q_clusters" in key or "k_clusters" in key or "q_bias" in key:
+                continue
             assert g.dtype == jnp.float32
             global_norm_square += jnp.sum(jax.lax.square(g))
         global_norm_square = jax.lax.psum(global_norm_square, ("d", "t"))
@@ -910,12 +924,13 @@ def training_step(
             adam_nu=jax.tree_util.tree_unflatten(grad_treedef, new_nus),
         )
         metrics = Metrics(
-            loss=loss,
+            loss=loop_metrics.ce_loss,
             learning_rate=lr,
             grad_norm=global_norm * rescale,
             raw_grad_norm=global_norm,
-            avg_cum_prob_loaded=loop_metrics.avg_cum_prob_loaded,
+            avg_cluster_recall=loop_metrics.avg_cluster_recall,
             bias_norm=loop_metrics.bias_norm,
+            total_loss=loss,
         )
         return new_state, metrics
 
@@ -1018,8 +1033,9 @@ def main_contained(config, logger):
             cum_metrics.grad_norm += metrics.grad_norm
             cum_metrics.raw_grad_norm += metrics.raw_grad_norm
             cum_metrics.learning_rate += metrics.learning_rate
-            cum_metrics.avg_cum_prob_loaded += metrics.avg_cum_prob_loaded
+            cum_metrics.avg_cluster_recall += metrics.avg_cluster_recall
             cum_metrics.bias_norm += metrics.bias_norm
+            cum_metrics.total_loss += metrics.total_loss
 
         start_time = time.time()
 
@@ -1091,9 +1107,10 @@ def main_contained(config, logger):
                         learning_rate=cum_metrics.learning_rate / log_interval,
                         grad_norm=cum_metrics.grad_norm / log_interval,
                         raw_grad_norm=cum_metrics.raw_grad_norm / log_interval,
-                        avg_cum_prob_loaded=cum_metrics.avg_cum_prob_loaded
+                        avg_cluster_recall=cum_metrics.avg_cluster_recall
                         / log_interval,
                         bias_norm=cum_metrics.bias_norm / log_interval,
+                        total_loss=cum_metrics.total_loss / log_interval,
                     )
                 else:
                     cum_metrics = output

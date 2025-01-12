@@ -53,12 +53,13 @@ class IOConfig:
     max_io_threads: int
 
 
-def log(step: int, logger: Logger, output: PyTree):
+def log(step: int, logger: Logger, metrics: PyTree, stats_dict: PyTree = None):
     """Logs the output of a training step. The output must be a PyTree of f32 arrays."""
 
     if is_device_0():
         metrics_dict = {}
-        for path, arr in jax.tree_util.tree_leaves_with_path(output):
+        # First log the metrics
+        for path, arr in jax.tree_util.tree_leaves_with_path(metrics):
             path = jax.tree_util.keystr(path)
             if path not in path_map:
                 path_map[path] = (path, path)
@@ -90,6 +91,20 @@ def log(step: int, logger: Logger, output: PyTree):
                 raise ValueError(
                     f"Output {path} has unsupported shape {arr.shape} and dtype {arr.dtype}."
                 )
+
+        # Then log the stats if provided
+        if stats_dict is not None:
+            for stat_name, stat in stats_dict.stats.items():
+                for stat_type, stat_value in vars(stat).items():
+                    if logger:
+                        logger.report_scalar(
+                            title=f"{stat_name}",
+                            series=stat_type,
+                            value=float(stat_value),
+                            iteration=step,
+                        )
+                    metrics_dict[f"{stat_name}/{stat_type}"] = float(stat_value)
+
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if not logger:
             print(f"[{now}] Step {step}: {metrics_dict}")

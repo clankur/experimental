@@ -138,6 +138,54 @@ class StatsDict:
     ce_loss: f32[b""]
 
 
+@pytree_dataclass
+class CumulativeStatsDict:
+    """Accumulates StatsDict over multiple steps."""
+
+    stats: Dict[str, GlobalStats]
+    ce_loss: f32[b""]
+    count: int = 0
+
+    @staticmethod
+    def create() -> "CumulativeStatsDict":
+        return CumulativeStatsDict(stats={}, ce_loss=jnp.float32(0.0), count=0)
+
+    def update(self, other: StatsDict):
+        if not self.stats:
+            self.stats = {k: v for k, v in other.stats.items()}
+        else:
+            for k, v in other.stats.items():
+                if k in self.stats:
+                    self.stats[k] = GlobalStats(
+                        max=self.stats[k].max + v.max,
+                        min=self.stats[k].min + v.min,
+                        mean=self.stats[k].mean + v.mean,
+                        std=self.stats[k].std + v.std,
+                        abs_max=self.stats[k].abs_max + v.abs_max,
+                        abs_mean=self.stats[k].abs_mean + v.abs_mean,
+                    )
+                else:
+                    self.stats[k] = v
+        self.ce_loss += other.ce_loss
+        self.count += 1
+
+    def average(self) -> StatsDict:
+        if self.count == 0:
+            return StatsDict(stats={}, ce_loss=jnp.float32(0.0))
+
+        averaged_stats = {}
+        for k, v in self.stats.items():
+            averaged_stats[k] = GlobalStats(
+                max=v.max / self.count,
+                min=v.min / self.count,
+                mean=v.mean / self.count,
+                std=v.std / self.count,
+                abs_max=v.abs_max / self.count,
+                abs_mean=v.abs_mean / self.count,
+            )
+        return StatsDict(stats=averaged_stats, ce_loss=self.ce_loss / self.count)
+
+
 def get_parameterization(style: str, fully_aligned: bool = True):
     Parameterization = namedtuple(
         "Parameterization",
@@ -815,13 +863,13 @@ def training_step(
     h: Hparams,
     hparams: TrainingHparams,
     batch: TokenBatch,
-) -> Tuple[Any, Metrics]:
+) -> Tuple[State, Tuple[Metrics, StatsDict]]:
     @partial(
         shardtypes.typed_shard_map, check_rep=False
     )  # check_rep=False for https://github.com/google/jax/issues/20335
     def sharded_step(
         state: State, step: u32[b""], batch: TokenBatch
-    ) -> Tuple[State, Metrics]:
+    ) -> Tuple[State, Tuple[Metrics, StatsDict]]:
         (
             (
                 loss,
@@ -963,7 +1011,7 @@ def training_step(
             raw_grad_norm=global_norm,
             total_loss=loss,
         )
-        return new_state, metrics
+        return new_state, (metrics, stats_dict)
 
     return sharded_step(state, step, batch)
 
@@ -1057,14 +1105,20 @@ def main_contained(config, logger):
         print(f"{log_interval=}")
 
         cum_metrics = None
+        cum_stats = None
 
-        def update_metrics(metrics: Metrics):
-            nonlocal cum_metrics
-            cum_metrics.loss += metrics.loss
-            cum_metrics.grad_norm += metrics.grad_norm
-            cum_metrics.raw_grad_norm += metrics.raw_grad_norm
-            cum_metrics.learning_rate += metrics.learning_rate
-            cum_metrics.total_loss += metrics.total_loss
+        def update_metrics(metrics: Metrics, stats_dict: StatsDict):
+            nonlocal cum_metrics, cum_stats
+            if cum_metrics is None:
+                cum_metrics = metrics
+                cum_stats = CumulativeStatsDict.create()
+            else:
+                cum_metrics.loss += metrics.loss
+                cum_metrics.grad_norm += metrics.grad_norm
+                cum_metrics.raw_grad_norm += metrics.raw_grad_norm
+                cum_metrics.learning_rate += metrics.learning_rate
+                cum_metrics.total_loss += metrics.total_loss
+            cum_stats.update(stats_dict)
 
         start_time = time.time()
 
@@ -1107,7 +1161,9 @@ def main_contained(config, logger):
                 ).compile()
 
             batch = loader.load(step)
-            state, output = c_training_step(state, jnp.uint32(step), batch)
+            state, (metrics, stats_dict) = c_training_step(
+                state, jnp.uint32(step), batch
+            )
 
             # Run profile for two steps, to include data loading time in between them.
             if training_io.is_device_0() and step == start_step + 2:
@@ -1138,12 +1194,16 @@ def main_contained(config, logger):
                         raw_grad_norm=cum_metrics.raw_grad_norm / log_interval,
                         total_loss=cum_metrics.total_loss / log_interval,
                     )
+                    cum_stats = cum_stats.average()
                 else:
-                    cum_metrics = output
-                training_io.log(step, logger, cum_metrics)
-                cum_metrics = output
+                    cum_metrics = metrics
+                    cum_stats = stats_dict
+                training_io.log(step, logger, cum_metrics, cum_stats)
+                cum_metrics = metrics
+                cum_stats = CumulativeStatsDict.create()
+                cum_stats.update(stats_dict)
             else:
-                update_metrics(output)
+                update_metrics(metrics, stats_dict)
 
         end_time = time.time()
         print(f"Total time: {end_time - start_time:.2f} seconds")

@@ -10,4 +10,12 @@ loss_data = get_loss_data(experiment_ids)
 # %%
 plot_loss_data(loss_data, plot_last=125)
 
+# %% [markdown]
+"""
+## Loss Analysis
+We essentially see that the number of clusters doesn't seem to worsen loss and slightly improves it.
+"""
+
+# %%
+
 # %%

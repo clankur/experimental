@@ -90,15 +90,27 @@ def log(step: int, logger: Logger, metrics: PyTree, stats_dict: PyTree = None):
             for stat_name, stat in stats_dict.items():
                 if "." in stat_name:
                     layer, stat_name = stat_name.split(".")
-                for stat_type, stat_value in vars(stat).items():
-                    if logger:
-                        logger.report_scalar(
-                            title=f"{stat_name}.{stat_type}",
-                            series=f"{layer}",
-                            value=float(stat_value),
-                            iteration=step,
+                    for stat_type, stat_value in vars(stat).items():
+                        if logger:
+                            logger.report_scalar(
+                                title=f"{stat_name}.{stat_type}",
+                                series=f"{layer}",
+                                value=float(stat_value),
+                                iteration=step,
+                            )
+                        metrics_dict[f"{stat_name}/{stat_type}/{layer}"] = float(
+                            stat_value
                         )
-                    metrics_dict[f"{stat_name}/{stat_type}/{layer}"] = float(stat_value)
+                else:
+                    for stat_type, stat_value in vars(stat).items():
+                        if logger:
+                            logger.report_scalar(
+                                title=f"{stat_name}",
+                                series=stat_type,
+                                value=float(stat_value),
+                                iteration=step,
+                            )
+                    metrics_dict[f"{stat_name}/{stat_type}"] = float(stat_value)
 
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if not logger:

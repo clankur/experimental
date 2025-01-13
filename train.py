@@ -119,7 +119,6 @@ class Stats:
     norm: f32[b""]
 
 
-# TODO: add per layer stats
 # TODO: add per head stats
 
 
@@ -603,6 +602,7 @@ class Model:
                 logits = alibi.apply(logits)
 
             logits = jnp.where(causal_mask, logits, -1e10)
+            stats["logits"] = get_stats(logits)
             probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
             stats["probs"] = get_stats(probs)
             # create a softmask

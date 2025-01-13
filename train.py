@@ -585,7 +585,6 @@ class Model:
             )
             cluster_wei = causal_mask * logits_c
             stats["cluster_wei"] = get_stats(cluster_wei)
-            # eval the prob of cluster_wei
 
             logit_scale = jax.lax.select(
                 h.parameterization.lower() == "mup",
@@ -601,20 +600,29 @@ class Model:
             if h.apply_alibi:
                 logits = alibi.apply(logits)
 
+            # TODO: emit min of the max(query-key alignments)
             logits = jnp.where(causal_mask, logits, -1e10)
+            min_max_qk_alignment = einops.reduce(
+                einops.reduce(logits, "B Qlen Klen Q K -> B Qlen Q K", "max"),
+                "B Qlen Q K -> B Q K",
+                "min",
+            )
+            stats["min_max_qk_alignment"] = get_stats(min_max_qk_alignment)
             stats["logits"] = get_stats(logits)
             probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
             stats["probs"] = get_stats(probs)
             # create a softmask
             stats["cluster_recall"] = get_stats(
-                jnp.sum(jax.lax.stop_gradient(probs) * logits_c, axis=2)
+                jnp.sum(jax.lax.stop_gradient(probs) * cluster_wei, axis=2)
             )
-            # check if probs sum greater > 1, log total prob of each query
-            # max value of cluster_wei, max and mean of (abs(cluster_wei))
+            # TODO: at a certain step, start applying cluster_wei to the probs
 
-            # want a loss based on prob per token loaded, total_prob/total_tokens_loaded, if below threshold drop it
-            # get a one hot coding, sum along a cluster index
-            # get a loss based on prob per token loaded, total_prob/total_tokens_loaded, if below threshold drop it
+            # check if probs sum greater > 1, log total prob of each query
+
+            # maybe we want a loss based on prob per token loaded, total_prob/total_tokens_loaded, if below threshold drop it
+            # to raise precision?
+            # to get total retrieved, get a one hot coding based on threhold, sum along a cluster index, divide by sum along causal mask's key axis
+
             attn_out = shardops.einsum_unreduced(
                 "B/d Qlen Klen Q K/t, B/d Klen K/t D -> B/d Qlen Q K/t D", probs, v
             )

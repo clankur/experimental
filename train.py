@@ -104,7 +104,6 @@ class GlobalStats:
     max: f32[b""]
     min: f32[b""]
     mean: f32[b""]
-    std: f32[b""]
     abs_max: f32[b""]
     abs_mean: f32[b""]
 
@@ -124,7 +123,6 @@ def get_stats(x: Union[f32[b"B/d Qlen Klen Q K/t"]]) -> GlobalStats:
         max=jnp.max(x),
         min=jnp.min(x),
         mean=jnp.mean(x),
-        std=jnp.std(x),
         abs_max=jnp.max(jnp.abs(x)),
         abs_mean=jnp.mean(jnp.abs(x)),
     )
@@ -135,7 +133,6 @@ class StatsDict:
     """Metrics for the forward pass. currently placeholders."""
 
     stats: Dict[str, GlobalStats]
-    ce_loss: f32[b""]
 
 
 @pytree_dataclass
@@ -143,12 +140,11 @@ class CumulativeStatsDict:
     """Accumulates StatsDict over multiple steps."""
 
     stats: Dict[str, GlobalStats]
-    ce_loss: f32[b""]
     count: int = 0
 
     @staticmethod
     def create() -> "CumulativeStatsDict":
-        return CumulativeStatsDict(stats={}, ce_loss=jnp.float32(0.0), count=0)
+        return CumulativeStatsDict(stats={}, count=0)
 
     def update(self, other: StatsDict):
         if not self.stats:
@@ -160,18 +156,16 @@ class CumulativeStatsDict:
                         max=self.stats[k].max + v.max,
                         min=self.stats[k].min + v.min,
                         mean=self.stats[k].mean + v.mean,
-                        std=self.stats[k].std + v.std,
                         abs_max=self.stats[k].abs_max + v.abs_max,
                         abs_mean=self.stats[k].abs_mean + v.abs_mean,
                     )
                 else:
                     self.stats[k] = v
-        self.ce_loss += other.ce_loss
         self.count += 1
 
     def average(self) -> StatsDict:
         if self.count == 0:
-            return StatsDict(stats={}, ce_loss=jnp.float32(0.0))
+            return StatsDict(stats={})
 
         averaged_stats = {}
         for k, v in self.stats.items():
@@ -179,11 +173,10 @@ class CumulativeStatsDict:
                 max=v.max / self.count,
                 min=v.min / self.count,
                 mean=v.mean / self.count,
-                std=v.std / self.count,
                 abs_max=v.abs_max / self.count,
                 abs_mean=v.abs_mean / self.count,
             )
-        return StatsDict(stats=averaged_stats, ce_loss=self.ce_loss / self.count)
+        return StatsDict(stats=averaged_stats)
 
 
 def get_parameterization(style: str, fully_aligned: bool = True):
@@ -579,16 +572,18 @@ class Model:
             )
             q_bias_norm = jnp.linalg.norm(q_bias, axis=-1)
             q_c = jax.nn.sigmoid(q_c)
-            k_c = jax.nn.softmax(k_c, axis=2)
+            k_c = jax.nn.softmax(k_c, axis=-1)
             # report q_c average to metrics
             stats["q_c"] = get_stats(q_c)
+            stats["k_c"] = get_stats(k_c)
+            stats["q_bias_norm"] = get_stats(q_bias_norm)
 
             logits_c = shardops.einsum_unreduced(
                 "B/d Qlen Q K/t n_clusters, B/d Klen K/t n_clusters -> B/d Qlen Klen Q K/t",
                 q_c,
                 k_c,
-            ) / math.sqrt(h.n_clusters)
-            cluster_wei = jnp.where(causal_mask, logits_c, -1e10)
+            )
+            stats["cluster_wei"] = get_stats(logits_c)
             # eval the prob of cluster_wei
 
             logit_scale = jax.lax.select(
@@ -610,7 +605,7 @@ class Model:
             stats["probs"] = get_stats(probs)
             # create a softmask
             stats["cluster_recall"] = get_stats(
-                jax.lax.stop_gradient(probs) * cluster_wei
+                jnp.sum(jax.lax.stop_gradient(probs) * logits_c, axis=2)
             )
             # check if probs sum greater > 1, log total prob of each query
             # max value of cluster_wei, max and mean of (abs(cluster_wei))
@@ -664,7 +659,7 @@ class Model:
             ffn_out = shardops.psum_scatter("B/d L M -> B/d L M/t", ffn_out)
 
             return (jnp.bfloat16(x + ffn_out), step, total_steps), StatsDict(
-                stats=stats, ce_loss=jnp.float32(0.0)
+                stats=stats
             )
 
         (x, _, _), layer_stats = jax.lax.scan(
@@ -677,7 +672,6 @@ class Model:
                 max=jnp.max(value.max),
                 min=jnp.min(value.min),
                 mean=jnp.mean(value.mean),
-                std=jnp.std(value.std),
                 abs_max=jnp.max(value.abs_max),
                 abs_mean=jnp.mean(value.abs_mean),
             )
@@ -698,12 +692,12 @@ class Model:
             preferred_element_type=jnp.float32,
         )
 
-        return logits, StatsDict(stats=global_stats, ce_loss=jnp.float32(0.0))
+        return logits, StatsDict(stats=global_stats)
 
     @typechecked
     def loss(
         self, h: Hparams, batch: TokenBatch, step: u32[b""], total_steps: u32[b""]
-    ) -> Tuple[f32[b""], StatsDict]:
+    ) -> Tuple[f32[b""], Tuple[f32[b""], StatsDict]]:
         # Given sequence-packed targets:
         #   [[1, 2], [3, 4, 5], [6, 7, 8, 9]]
         # we want inputs:
@@ -736,7 +730,7 @@ class Model:
         total_loss = ce_loss + recall_loss
         return (
             total_loss,
-            StatsDict(stats=stats_dict.stats, ce_loss=ce_loss),
+            (ce_loss, stats_dict),
         )
 
 
@@ -873,7 +867,7 @@ def training_step(
         (
             (
                 loss,
-                stats_dict,
+                (ce_loss, stats_dict),
             ),
             grad,
         ) = jax.value_and_grad(
@@ -889,6 +883,8 @@ def training_step(
         #
         # So we reduce the loss across chips _outside_ the autodiff.
         loss = jax.lax.psum(loss, ("d", "t"))
+        ce_loss = jax.lax.psum(ce_loss, ("d", "t"))
+        print(stats_dict.stats.keys())
         for key, value in stats_dict.stats.items():
             stats_dict.stats[key] = jax.lax.pmean(value, ("d", "t"))
 
@@ -1005,7 +1001,7 @@ def training_step(
             adam_nu=jax.tree_util.tree_unflatten(grad_treedef, new_nus),
         )
         metrics = Metrics(
-            loss=stats_dict.ce_loss,
+            loss=ce_loss,
             learning_rate=lr,
             grad_norm=global_norm * rescale,
             raw_grad_norm=global_norm,

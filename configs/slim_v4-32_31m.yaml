@@ -52,6 +52,5 @@ model:
 checkpoint_interval: 9200
 
 hf_dataset:
-  path: cerebras/SlimPajama-627B
   num_workers:  32
   select_column: "text"

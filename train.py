@@ -622,10 +622,27 @@ class Model:
             stats["cluster_recall"] = get_stats(
                 jnp.sum(jax.lax.stop_gradient(probs) * cluster_wei, axis=2)
             )
-            # TODO: at a certain step, start applying cluster_wei to the probs
-
-            # check if probs sum greater > 1, log total prob of each query
-
+            # TODO:
+            # 1. at a certain step, start applying softmask  (cluster_wei to the probs)
+            apply_softmask = step >= h.softmask_start_fraction * total_steps
+            apply_hardmask = step >= h.hardmask_start_fraction * total_steps
+            probs = jax.lax.select(
+                apply_softmask,  # jnp.logical_xor(apply_softmask, apply_hardmask)
+                jnp.bfloat16(probs * cluster_wei),
+                probs,
+            )
+            stats["softmask_probs"] = get_stats(probs)
+            # # 2.5. add hardmask metrics - want to know how much we retrieve
+            # # probs = jax.lax.select(apply_hardmask, probs * cluster_wei, probs)
+            hardmask = cluster_wei > h.hard_threshold
+            # # probs = jax.lax.select(
+            # #     apply_hardmask, jnp.bfloat16(probs * hardmask), probs
+            # # )
+            # # stats["hardmask_probs"] = get_stats(probs)
+            retrieved_percent = (
+                jnp.sum(hardmask, axis=2) / jnp.sum(causal_mask, axis=2) * 100.0
+            )
+            stats["retrieved_percent"] = get_stats(retrieved_percent)
             # maybe we want a loss based on prob per token loaded, total_prob/total_tokens_loaded, if below threshold drop it
             # to raise precision?
             # to get total retrieved, get a one hot coding based on threhold, sum along a cluster index, divide by sum along causal mask's key axis
@@ -751,10 +768,8 @@ class Model:
         )
         tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
         ce_loss = -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
-        recall_loss = -jnp.sum(stats_dict["cluster_recall"].mean)
-        total_loss = ce_loss + recall_loss
         return (
-            total_loss,
+            ce_loss,
             (ce_loss, stats_dict),
         )
 

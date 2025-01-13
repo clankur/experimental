@@ -583,7 +583,8 @@ class Model:
                 q_c,
                 k_c,
             )
-            stats["cluster_wei"] = get_stats(logits_c)
+            cluster_wei = causal_mask * logits_c
+            stats["cluster_wei"] = get_stats(cluster_wei)
             # eval the prob of cluster_wei
 
             logit_scale = jax.lax.select(
@@ -1084,6 +1085,8 @@ def main_contained(config, logger):
         state = jax.jit(partial(State.init, config.model))(
             fold_in_str(root_rng, "init")
         )
+        #
+        # Do we apply variance scaling because we want the distribution to be IID or is it also because we want it to be uniform and normal?
 
         state, start_step = training_io.load_checkpoint_if_it_exists(
             model_dir, state, config.io

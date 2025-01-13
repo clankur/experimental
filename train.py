@@ -97,6 +97,9 @@ class Hparams:
     rope_max_timescale: int
     apply_rope: Optional[bool] = True
     apply_alibi: Optional[bool] = False
+    softmask_start_fraction: Optional[float] = 1.0
+    hardmask_start_fraction: Optional[float] = 1.0
+    hard_threshold: Optional[float] = 0.0
 
 
 @pytree_dataclass
@@ -602,8 +605,12 @@ class Model:
 
             # TODO: emit min of the max(query-key alignments)
             logits = jnp.where(causal_mask, logits, -1e10)
+            max_qk_alignment = einops.reduce(
+                logits, "B Qlen Klen Q K -> B Qlen Q K", "max"
+            )
+            stats["max_qk_alignment"] = get_stats(max_qk_alignment)
             min_max_qk_alignment = einops.reduce(
-                einops.reduce(logits, "B Qlen Klen Q K -> B Qlen Q K", "max"),
+                max_qk_alignment,
                 "B Qlen Q K -> B Q K",
                 "min",
             )

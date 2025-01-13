@@ -106,6 +106,17 @@ class GlobalStats:
     mean: f32[b""]
     abs_max: f32[b""]
     abs_mean: f32[b""]
+    norm: f32[b""]
+
+
+@pytree_dataclass
+class Stats:
+    max: f32[b""]
+    min: f32[b""]
+    mean: f32[b""]
+    abs_max: f32[b""]
+    abs_mean: f32[b""]
+    norm: f32[b""]
 
 
 # TODO: add per layer stats
@@ -117,22 +128,19 @@ class GlobalStats:
 # precision: retrieval mask - use a threshold for the queries
 
 
-def get_stats(x: Union[f32[b"B/d Qlen Klen Q K/t"]]) -> GlobalStats:
-
-    return GlobalStats(
-        max=jnp.max(x),
-        min=jnp.min(x),
-        mean=jnp.mean(x),
-        abs_max=jnp.max(jnp.abs(x)),
-        abs_mean=jnp.mean(jnp.abs(x)),
+def get_stats(x) -> Stats:
+    sx = jax.lax.stop_gradient(x)
+    return Stats(
+        max=jax.lax.pmax(jnp.max(sx), ("d", "t")),
+        min=jax.lax.pmin(jnp.min(sx), ("d", "t")),
+        mean=jax.lax.pmean(jnp.mean(x), ("d", "t")),
+        abs_max=jax.lax.pmax(jnp.max(jnp.abs(sx)), ("d", "t")),
+        abs_mean=jax.lax.pmean(jnp.mean(jnp.abs(x)), ("d", "t")),
+        norm=jnp.sqrt(jax.lax.pmean(jnp.mean(jnp.square(x)), ("d", "t"))),
     )
 
 
-@pytree_dataclass
-class StatsDict:
-    """Metrics for the forward pass. currently placeholders."""
-
-    stats: Dict[str, GlobalStats]
+StatsDict = dict[str, Stats]
 
 
 @pytree_dataclass
@@ -148,9 +156,9 @@ class CumulativeStatsDict:
 
     def update(self, other: StatsDict):
         if not self.stats:
-            self.stats = {k: v for k, v in other.stats.items()}
+            self.stats = {k: v for k, v in other.items()}
         else:
-            for k, v in other.stats.items():
+            for k, v in other.items():
                 if k in self.stats:
                     self.stats[k] = GlobalStats(
                         max=self.stats[k].max + v.max,
@@ -158,6 +166,7 @@ class CumulativeStatsDict:
                         mean=self.stats[k].mean + v.mean,
                         abs_max=self.stats[k].abs_max + v.abs_max,
                         abs_mean=self.stats[k].abs_mean + v.abs_mean,
+                        norm=self.stats[k].norm + v.norm,
                     )
                 else:
                     self.stats[k] = v
@@ -165,7 +174,7 @@ class CumulativeStatsDict:
 
     def average(self) -> StatsDict:
         if self.count == 0:
-            return StatsDict(stats={})
+            return {}
 
         averaged_stats = {}
         for k, v in self.stats.items():
@@ -175,8 +184,9 @@ class CumulativeStatsDict:
                 mean=v.mean / self.count,
                 abs_max=v.abs_max / self.count,
                 abs_mean=v.abs_mean / self.count,
+                norm=v.norm / self.count,
             )
-        return StatsDict(stats=averaged_stats)
+        return averaged_stats
 
 
 def get_parameterization(style: str, fully_aligned: bool = True):
@@ -659,25 +669,33 @@ class Model:
             )
             ffn_out = shardops.psum_scatter("B/d L M -> B/d L M/t", ffn_out)
 
-            return (jnp.bfloat16(x + ffn_out), step, total_steps), StatsDict(
-                stats=stats
-            )
+            return (jnp.bfloat16(x + ffn_out), step, total_steps), stats
 
         (x, _, _), layer_stats = jax.lax.scan(
             loop_body,
             (jnp.bfloat16(x), step, total_steps),
             self.transformer,
         )
-        global_stats = {
-            key: GlobalStats(
+        ret = {}
+        for key, t in layer_stats.items():
+            for layer in range(h.layers):
+                ret[f"{layer}.{key}"] = Stats(
+                    mean=t.mean[layer],
+                    max=t.max[layer],
+                    min=t.min[layer],
+                    abs_max=t.abs_max[layer],
+                    abs_mean=t.abs_mean[layer],
+                    norm=t.norm[layer],
+                )
+        for key, value in layer_stats.items():
+            ret[key] = Stats(
                 max=jnp.max(value.max),
                 min=jnp.min(value.min),
                 mean=jnp.mean(value.mean),
                 abs_max=jnp.max(value.abs_max),
                 abs_mean=jnp.mean(value.abs_mean),
+                norm=jnp.mean(value.norm),
             )
-            for key, value in layer_stats.stats.items()
-        }
 
         ##### Final layernorm and output projection.
         x = shardops.all_gather("B/d L M/t -> B/d L M", x)
@@ -693,7 +711,7 @@ class Model:
             preferred_element_type=jnp.float32,
         )
 
-        return logits, StatsDict(stats=global_stats)
+        return logits, ret
 
     @typechecked
     def loss(
@@ -727,7 +745,7 @@ class Model:
         )
         tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
         ce_loss = -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
-        recall_loss = -stats_dict.stats["cluster_recall"].mean
+        recall_loss = -jnp.sum(stats_dict["cluster_recall"].mean)
         total_loss = ce_loss + recall_loss
         return (
             total_loss,
@@ -885,9 +903,6 @@ def training_step(
         # So we reduce the loss across chips _outside_ the autodiff.
         loss = jax.lax.psum(loss, ("d", "t"))
         ce_loss = jax.lax.psum(ce_loss, ("d", "t"))
-        print(stats_dict.stats.keys())
-        for key, value in stats_dict.stats.items():
-            stats_dict.stats[key] = jax.lax.pmean(value, ("d", "t"))
 
         # Other than global-norm of gradients, no other communication is needed during the weight update,
         # because weights and grads are already fully sharded, as checked below.

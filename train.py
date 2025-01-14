@@ -635,10 +635,10 @@ class Model:
             # # 2.5. add hardmask metrics - want to know how much we retrieve
             # # probs = jax.lax.select(apply_hardmask, probs * cluster_wei, probs)
             hardmask = cluster_wei > h.hard_threshold
-            # probs = jax.lax.select(
-            #     apply_hardmask, jnp.bfloat16(probs * hardmask), probs
-            # )
-            # stats["hardmask_probs"] = get_stats(probs)
+            probs = jax.lax.select(
+                apply_hardmask, jnp.bfloat16(probs * hardmask), probs
+            )
+            stats["hardmask_probs"] = get_stats(probs)
             retrieved_percent = (
                 jnp.sum(hardmask, axis=2) / jnp.sum(causal_mask, axis=2) * 100.0
             )
@@ -768,8 +768,10 @@ class Model:
         )
         tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
         ce_loss = -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
+        recall_loss = -jnp.sum(stats_dict["cluster_recall"].mean)
+        total_loss = ce_loss + recall_loss
         return (
-            ce_loss,
+            total_loss,
             (ce_loss, stats_dict),
         )
 

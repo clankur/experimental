@@ -1299,8 +1299,18 @@ def main_contained(config, logger):
         print(f"Perplexity: {perplexity:.4f}")
 
         if logger:
-            logger.report_scalar("eval", "final_loss", avg_loss)
-            logger.report_scalar("eval", "final_perplexity", perplexity)
+            logger.report_scalar(
+                series="eval",
+                title="final_loss",
+                value=avg_loss,
+                iteration=config.training.steps,
+            )
+            logger.report_scalar(
+                series="eval",
+                title="final_perplexity",
+                value=perplexity,
+                iteration=config.training.steps,
+            )
 
 
 def clear_tpu_locks():

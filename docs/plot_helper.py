@@ -12,7 +12,6 @@ def get_loss_data(task_ids):
         y_values = scalar_logs["loss"]["loss"]["y"]
 
         task_name = task.name.replace("model.", "")
-        print(task.id, task_name)
         loss_data[task_id] = {"name": task_name, "steps": x_values, "loss": y_values}
     return loss_data
 

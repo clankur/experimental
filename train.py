@@ -892,18 +892,35 @@ class State:
         return State(weights=weights, adam_mu=adam_mu, adam_nu=adam_nu)
 
 
-@partial(jax.jit, static_argnums=(1))
+@partial(jax.jit, static_argnums=(2))
 @shardtypes.scope
-def eval_model(state: State, h: Hparams, batch: TokenBatch) -> f32[b""]:
+def eval_model(
+    state: State,
+    step: u32[b""],
+    h: Hparams,
+    batch: TokenBatch,
+) -> Tuple[f32[b""], Tuple[f32[b""], StatsDict]]:
     @partial(shardtypes.typed_shard_map, check_rep=False)
-    def eval_model_shard(state: State, batch: TokenBatch) -> f32[b""]:
-        loss, _ = jax.value_and_grad(lambda weights: weights.loss(h, batch))(
-            state.weights
-        )
+    def eval_model_shard(
+        state: State, step: u32[b""], batch: TokenBatch
+    ) -> Tuple[f32[b""], f32[b""], StatsDict]:
+        (
+            (
+                loss,
+                (ce_loss, stats_dict),
+            ),
+            _,
+        ) = jax.value_and_grad(
+            lambda weights: weights.loss(
+                h, batch, step, jnp.uint32(0)
+            ),  # we want to use hard mask here, so  total_steps=0
+            has_aux=True,
+        )(state.weights)
         loss = jax.lax.psum(loss, ("d", "t"))
-        return loss
+        ce_loss = jax.lax.psum(ce_loss, ("d", "t"))
+        return loss, ce_loss, stats_dict
 
-    return eval_model_shard(state, batch)
+    return eval_model_shard(state, step, batch)
 
 
 @partial(jax.jit, static_argnums=(2, 3), donate_argnums=(0,))
@@ -1268,8 +1285,11 @@ def main_contained(config, logger):
 
         for step in range(num_batches):
             batch = loader.load(step)
-            loss = eval_model(state, config.model, batch)
+            _, loss, stats_dict = eval_model(
+                state, jnp.uint32(step), config.model, batch
+            )
             total_loss += loss
+            training_io.log_eval_stats(step, logger, stats_dict)
 
         avg_loss = total_loss / num_batches
         perplexity = jnp.exp(avg_loss)

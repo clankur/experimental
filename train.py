@@ -619,7 +619,18 @@ class Model:
             )
             stats["min_max_qk_alignment"] = get_stats(min_max_qk_alignment)
             stats["logits"] = get_stats(logits)
-            probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
+            max_logits = einops.reduce(logits, "B Qlen Klen Q K -> B Qlen 1 Q K", "max")
+            probs = jnp.bfloat16(
+                (jnp.exp(logits - max_logits))
+                / (
+                    1
+                    + einops.reduce(
+                        (jnp.exp(logits - max_logits)),
+                        "B Qlen Klen Q K -> B Qlen 1 Q K",
+                        "sum",
+                    )
+                )
+            )  # softmax with 0 logit padding, drop logits that have negative alignment
             stats["probs"] = get_stats(probs)
             # create a softmask
             softmask_probs = jnp.bfloat16(jax.lax.stop_gradient(probs) * softmask)

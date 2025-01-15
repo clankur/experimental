@@ -97,9 +97,9 @@ class Hparams:
     rope_max_timescale: int
     apply_rope: Optional[bool] = True
     apply_alibi: Optional[bool] = False
-    softmask_start_fraction: Optional[float] = 1.0
-    hardmask_start_fraction: Optional[float] = 1.0
-    hard_threshold: Optional[float] = 0.0
+    softmask_start_fraction: float = 1.0
+    hardmask_start_fraction: float = 1.0
+    hard_q_threshold: float = 0.5
 
 
 @pytree_dataclass
@@ -579,15 +579,18 @@ class Model:
             # report q_c average to metrics
             stats["q_c"] = get_stats(q_c)
             stats["k_c"] = get_stats(k_c)
-            stats["q_bias_norm"] = get_stats(q_bias_norm)
-
-            logits_c = shardops.einsum_unreduced(
-                "B/d Qlen Q K/t n_clusters, B/d Klen K/t n_clusters -> B/d Qlen Klen Q K/t",
-                q_c,
-                k_c,
+            # q_c = what cluster clusters matter
+            # k_c = whats the most important cluster
+            # softmask = soft selection of clusters based on q_c-k_c alignment
+            softmask = (
+                shardops.einsum_unreduced(
+                    "B/d Qlen Q K/t n_clusters, B/d Klen K/t n_clusters -> B/d Qlen Klen Q K/t",
+                    q_c,
+                    k_c,
+                )
+                * causal_mask
             )
-            cluster_wei = causal_mask * logits_c
-            stats["cluster_wei"] = get_stats(cluster_wei)
+            stats["softmask"] = get_stats(softmask)
 
             logit_scale = jax.lax.select(
                 h.parameterization.lower() == "mup",
@@ -619,26 +622,31 @@ class Model:
             probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
             stats["probs"] = get_stats(probs)
             # create a softmask
+            softmask_probs = jnp.bfloat16(jax.lax.stop_gradient(probs) * softmask)
+            cluster_recall = jnp.sum(softmask_probs, axis=2, dtype=jnp.float32)
             stats["cluster_recall"] = get_stats(
-                jnp.sum(jax.lax.stop_gradient(probs) * cluster_wei, axis=2)
-            )
-            # TODO:
-            # 1. at a certain step, start applying softmask  (cluster_wei to the probs)
+                cluster_recall
+            )  # how much of the total probability we recall after masking
             apply_softmask = step >= h.softmask_start_fraction * total_steps
             apply_hardmask = step >= h.hardmask_start_fraction * total_steps
-            probs = jax.lax.select(
-                apply_softmask,  # jnp.logical_xor(apply_softmask, apply_hardmask)
-                jnp.bfloat16(probs * cluster_wei),
-                probs,
+            probs = jax.lax.select(apply_softmask, softmask_probs, probs)
+            k_cluster_selection = jnp.argmax(k_c, axis=-1)
+            hard_k_c = jax.nn.one_hot(k_cluster_selection, h.n_clusters)
+            hard_q_c = (
+                q_c > h.hard_q_threshold
+            )  # does this mean if no q clusters have >.5 the keys are entirely dropped despite selecting a cluster
+            hardmask = (
+                shardops.einsum_unreduced(
+                    "B/d Qlen Q K/t n_clusters, B/d Klen K/t n_clusters -> B/d Qlen Klen Q K/t",
+                    hard_q_c,
+                    hard_k_c,
+                )
+                * causal_mask
             )
-            stats["softmask_probs"] = get_stats(probs)
-            # # 2.5. add hardmask metrics - want to know how much we retrieve
-            # # probs = jax.lax.select(apply_hardmask, probs * cluster_wei, probs)
-            hardmask = cluster_wei > h.hard_threshold
-            probs = jax.lax.select(
-                apply_hardmask, jnp.bfloat16(probs * hardmask), probs
-            )
-            stats["hardmask_probs"] = get_stats(probs)
+            hardmask_probs = jnp.bfloat16(probs * hardmask)
+            probs = jax.lax.select(apply_hardmask, hardmask_probs, probs)
+            hard_cluster_recall = jnp.sum(softmask_probs, axis=2, dtype=jnp.float32)
+            stats["hard_cluster_recall"] = get_stats(hard_cluster_recall)
             retrieved_percent = (
                 jnp.sum(hardmask, axis=2) / jnp.sum(causal_mask, axis=2) * 100.0
             )
@@ -768,7 +776,7 @@ class Model:
         )
         tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
         ce_loss = -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
-        recall_loss = -jnp.sum(stats_dict["cluster_recall"].mean)
+        recall_loss = -stats_dict["cluster_recall"].mean
         total_loss = ce_loss + recall_loss
         return (
             total_loss,

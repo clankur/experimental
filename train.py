@@ -104,16 +104,6 @@ class Hparams:
 
 
 @pytree_dataclass
-class GlobalStats:
-    max: f32[b""]
-    min: f32[b""]
-    mean: f32[b""]
-    abs_max: f32[b""]
-    abs_mean: f32[b""]
-    norm: f32[b""]
-
-
-@pytree_dataclass
 class Stats:
     max: f32[b""]
     min: f32[b""]
@@ -126,8 +116,6 @@ class Stats:
 # TODO: add per head stats
 
 
-# Add stats function
-# loop metrics is just a dict of stats
 # precision: retrieval mask - use a threshold for the queries
 
 
@@ -150,7 +138,7 @@ StatsDict = dict[str, Stats]
 class CumulativeStatsDict:
     """Accumulates StatsDict over multiple steps."""
 
-    stats: Dict[str, GlobalStats]
+    stats: Dict[str, Stats]
     count: int = 0
 
     @staticmethod
@@ -163,7 +151,7 @@ class CumulativeStatsDict:
         else:
             for k, v in other.items():
                 if k in self.stats:
-                    self.stats[k] = GlobalStats(
+                    self.stats[k] = Stats(
                         max=self.stats[k].max + v.max,
                         min=self.stats[k].min + v.min,
                         mean=self.stats[k].mean + v.mean,
@@ -181,7 +169,7 @@ class CumulativeStatsDict:
 
         averaged_stats = {}
         for k, v in self.stats.items():
-            averaged_stats[k] = GlobalStats(
+            averaged_stats[k] = Stats(
                 max=v.max / self.count,
                 min=v.min / self.count,
                 mean=v.mean / self.count,
@@ -1412,20 +1400,6 @@ def main_contained(config, logger):
             print(f"\nEvaluation Results:")
             print(f"Average Loss: {avg_loss:.4f}")
             print(f"Perplexity: {perplexity:.4f}")
-
-            if logger:
-                logger.report_scalar(
-                    series="eval",
-                    title="final_loss",
-                    value=avg_loss,
-                    iteration=config.training.steps,
-                )
-                logger.report_scalar(
-                    series="eval",
-                    title="final_perplexity",
-                    value=perplexity,
-                    iteration=config.training.steps,
-                )
 
 
 def clear_tpu_locks():

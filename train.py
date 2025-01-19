@@ -65,9 +65,6 @@ PRNGKey = Any
 #   3. mask is standard causal mask, shape (L, L)
 
 
-# convert model to Transformer so we can have different implementations of it across the stages
-
-
 @dataclass(frozen=True)
 class BaseWidths:
     d_model: int
@@ -87,7 +84,7 @@ class Hparams:
     block_size: int
 
     vocab: int
-    layers: int
+    layers: int  # Number of concept decoder layers
     n_e_layers: int  # Number of encoder layers
     n_t_layers: int  # Number of token decoder layers
     base: BaseWidths
@@ -101,7 +98,7 @@ class Hparams:
     zero_queries: bool
     zero_unembed: bool
 
-    # parameters for exp scaling
+    # parameters for scaling exponents
     parameterization: str
     fully_aligned: bool
     gamma_embed: float
@@ -266,6 +263,7 @@ class Model:
     x_lnx: f32["n_t_layers d_model/t/d"]
     x_lnz: f32["n_t_layers d_model/t/d"]
 
+    # weights for weighted token-concept reduction
     w_mix: f32["block_size 1"]
     w_reduce_q: f32["1 n_q_per_kv n_kv/t d_head/d"]
     w_reduce_kv: f32["2 d_model/d n_kv/t d_head"]
@@ -995,7 +993,7 @@ class Model:
             )
 
         elif h.reduction_strategy == "cnn":
-            pass
+            raise NotImplementedError("CNN reduction strategy not implemented")
 
         # Process through concept decoder blocks
         x, () = jax.lax.scan(

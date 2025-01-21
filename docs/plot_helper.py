@@ -25,14 +25,17 @@ def get_experiment_ids_from_url(url: str) -> list[str]:
 
 def get_metrics_data(task_ids):
     metrics_data = {}
+    config_data = {}
     for task_id in task_ids:
         task = Task.get_task(task_id=task_id)
+        config = task.get_configuration_object_as_dict("OmegaConf")
+        config_data[task_id] = config
         scalar_logs = task.get_reported_scalars()
-
+        if "loss" not in scalar_logs:
+            print(f"Loss not found for task {task_id} with name {task.name}")
+            continue
         x_values = scalar_logs["loss"]["loss"]["x"]
         loss_values = scalar_logs["loss"]["loss"]["y"]
-
-        final_loss, final_perplexity = None, None
 
         final_loss = (
             None
@@ -53,7 +56,7 @@ def get_metrics_data(task_ids):
             "final_loss": final_loss,
             "final_perplexity": final_perplexity,
         }
-    return metrics_data
+    return metrics_data, config_data
 
 
 def calculate_ema(data, smoothing=0.97):
@@ -149,7 +152,7 @@ def get_eval_metrics_table(metrics_data):
         r"(?:.*?reduction_strategy=(?P<Reduction_Strategy>[^_]+(?:\.[^_]+)?))?"  # Optional reduction strategy
         r"(?:.*?layers=(?P<Concept_Decoder_Layers>\d+))?"  # Optional concept decoder layers
         r"(?:.*?learning_rate=(?P<Learning_Rate>[\d.]+))?"  # Optional learning rate
-        r"(?:.*?n_kv=(?P<Attention_Key_Value>\d+))?"  # Optional n_kv
+        r"(?:.*?n_kv=(?P<Attention_Heads>\d+))?"  # Optional n_kv
         r"(?:.*?n_q_per_kv=(?P<Query_Per_Key_Value>\d+))?"  # Optional n_q_per_kv
     )
 
@@ -170,7 +173,7 @@ def get_eval_metrics_table(metrics_data):
                     "Encoder_Layers",
                     "Token_Decoder_Layers",
                     "Concept_Decoder_Layers",
-                    "Attention_Key_Value",
+                    "Attention_Heads",
                     "Query_Per_Key_Value",
                 ]:
                     if fields[key] is not None:
@@ -204,7 +207,7 @@ def get_eval_metrics_table(metrics_data):
         "Encoder_Layers",
         "Token_Decoder_Layers",
         "Concept_Decoder_Layers",
-        "Attention_Key_Value",
+        "Attention_Heads",
         "Query_Per_Key_Value",
     ]
     float_columns = ["Learning_Rate", "Eval Loss"]

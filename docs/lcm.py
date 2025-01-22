@@ -1,11 +1,43 @@
 # %% [markdown]
-# # Large Concept Model Analysis
-# Last month Meta came out with an interesting paper on [Large Concept Models](https://arxiv.org/pdf/2412.08821)
+# # Extending Large Concept Models for KVCache Compression
+#
+# Last month, Meta published a paper on [Large Concept Models (LCMs)](https://arxiv.org/pdf/2412.08821), introducing a novel approach to language modeling focused on next-concept embedding prediction rather than next-token prediction. The architecture has three transformer components: a token-to-concept encoder, the concept decoder (the LCM), and a concept-to-token decoder.
+#
+# The token-to-concept encoder maps token chunks into the concept embedding space, capturing high-level semantics. The concept decoder refines these embeddings and predicts the next concept embedding from context. The concept-to-token decoder projects the output embedding back into token space to generate text. By operating in the concept space, the model captures and manipulates semantic relationships more effectively than token-based models.
+#
+# The paper uses a pretrained encoder/decoder architecture called SONAR but requires carefully curated input sequences, as embedding quality declines with longer or more complex inputs. The authors assume input sentences average 10–20 tokens and cap sentence length at 200 characters to preserve semantic relationships.
+#
+# ## Methodology
+#
+# Seeing that LCM enables representing multiple tokens as a single concept, I propose leveraging it to compress the KV Cache across time. For simplicity, I have made the following modifications to Meta's approach:
+# - Jointly train all encoders/decoders rather than using pretrained SONAR components. This also avoid its constraints of requiring careful selection for sequences.
+# - Use fixed-size token blocks as concepts instead of dynamic sizing
+# - Omit the diffusion-based LCM variants despite their superior performance
+#
+# ### Implementation Details
+#
+# The architecture consists of three components: a token-to-concept encoder with a mask (preventing attention to future concepts), a standard decoder operating in concept space, and a concept-to-token decoder that applies self-attention to input `x` followed by cross-attention with concept embedding `z`. I tested four reduction strategies for token-to-concept compression:
+# - Sum
+# - Max
+# - Learned weighted sum
+# - Attention based reduction
+#
+# All these implementation details can be see in [`train.py`](../train.py#L514) under the `forward_pass`. Further specifics on each component below:
+# - [`encoder_block`](../train.py#L568)
+# - [`concept_decoder_block`](../train.py#L664)
+# - [`token_decoder_block`](../train.py#L776)
+#
 
 # %%
+import importlib
+import plot_helper
+
+# %%
+importlib.reload(plot_helper)
 from plot_helper import *
 
 # %%
+
 TASK_IDS = [
     "58b7c60aa20e485d9c74a43819f720d5",
     "66b4c6f95b0e415aa26888bfc6efddf2",
@@ -44,16 +76,19 @@ TASK_IDS = [
     "cf39a009b8a84a9484972b6243a6faea",
     "c6107cde375f4840af40e3b64bde06eb",
 ]
+
 # %%
 metrics_data, config_data = get_metrics_data(TASK_IDS)
+[(id, data["name"]) for (id, data) in metrics_data.items()]
+# %% [markdown]
+# ## Results
+# Disappointingly none the implementations of LCM appear to even match the performance of the baseline.
 # %%
 plot_loss_data(metrics_data, plot_last=500, ema_smoothing=0.97, top_k=10, opacity=0.05)
 plot_loss_data(metrics_data, plot_last=500, ema_smoothing=0.99, top_k=5)
 
 # %%
 top_k_metrics_data = get_top_k_experiments(metrics_data, k=10, ema_smoothing=0.97)
-print("\n".join([f"{v['name']}" for (k, v) in top_k_metrics_data.items()]))
-
-# %%
 get_eval_metrics_table(metrics_data, config_data)
+
 # %%

@@ -1,9 +1,8 @@
-# %%
-import plot_helper
-import importlib
+# %% [markdown]
+# # Large Concept Model Analysis
+# Last month Meta came out with an interesting paper on [Large Concept Models](https://arxiv.org/pdf/2412.08821)
 
 # %%
-importlib.reload(plot_helper)
 from plot_helper import *
 
 # %%
@@ -41,11 +40,14 @@ TASK_IDS = [
     "ff77efbccb104aba8f719d258cde91ad",
     "979eba69eb8545b8892061fcdc4fbeaa",
     "d9e0de8de9714db8ae5ba6676c4bfed8",
+    "e537b35e73394fb18ff047099aeba1a0",
+    "cf39a009b8a84a9484972b6243a6faea",
+    "c6107cde375f4840af40e3b64bde06eb",
 ]
 # %%
 metrics_data, config_data = get_metrics_data(TASK_IDS)
 # %%
-plot_loss_data(metrics_data, plot_last=500, ema_smoothing=0.97, top_k=10)
+plot_loss_data(metrics_data, plot_last=500, ema_smoothing=0.97, top_k=10, opacity=0.05)
 plot_loss_data(metrics_data, plot_last=500, ema_smoothing=0.99, top_k=5)
 
 # %%
@@ -53,5 +55,5 @@ top_k_metrics_data = get_top_k_experiments(metrics_data, k=10, ema_smoothing=0.9
 print("\n".join([f"{v['name']}" for (k, v) in top_k_metrics_data.items()]))
 
 # %%
-get_eval_metrics_table(metrics_data)
+get_eval_metrics_table(metrics_data, config_data)
 # %%

@@ -5,6 +5,18 @@ import pandas as pd
 import re
 
 
+TRACKED_FIELDS = [
+    ("block_size", "Block_Size"),
+    ("layers", "Concept_Decoder_Layers"),
+    ("n_e_layers", "Encoder_Layers"),
+    ("n_t_layers", "Token_Decoder_Layers"),
+    ("reduction_strategy", "Reduction_Strategy"),
+    ("n_kv", "Attention_Heads"),
+    ("n_q_per_kv", "Query_Per_Key_Value"),
+    ("learning_rate", "Learning_Rate"),
+]
+
+
 def get_experiment_ids_from_url(url: str) -> list[str]:
     """Extract experiment IDs from a ClearML compare-experiments URL.
 
@@ -95,7 +107,11 @@ def get_top_k_experiments(
 
 
 def plot_loss_data(
-    loss_data, plot_last: int = 1000, ema_smoothing: float = 0.97, top_k: int = None
+    loss_data,
+    plot_last: int = 1000,
+    ema_smoothing: float = 0.97,
+    top_k: int = None,
+    opacity: float = 0.25,
 ):
     # Get top k experiments if specified
     if top_k is not None:
@@ -115,7 +131,7 @@ def plot_loss_data(
         color = ema_line.get_color()
 
         # Plot raw loss with same color but lower alpha
-        plt.plot(steps, loss, alpha=0.1, color=color)
+        plt.plot(steps, loss, alpha=opacity, color=color)
 
     plt.xlabel("Steps")
     plt.ylabel("Loss")
@@ -132,7 +148,7 @@ def plot_loss_data(
     plt.show()
 
 
-def get_eval_metrics_table(metrics_data):
+def get_eval_metrics_table(metrics_data, config_data):
     """
     Filter valid data, parse model configuration from the `name` field using regex,
     and create a DataFrame sorted by final evaluation loss.
@@ -144,17 +160,6 @@ def get_eval_metrics_table(metrics_data):
     Returns:
         pd.DataFrame: DataFrame with parsed and formatted evaluation metrics.
     """
-    # Regex pattern to capture configuration details (all fields optional)
-    pattern = re.compile(
-        r"(?:.*?block_size=(?P<Block_Size>\d+))?"  # Optional block size
-        r"(?:.*?n_e_layers=(?P<Encoder_Layers>\d+))?"  # Optional encoder layers
-        r"(?:.*?n_t_layers=(?P<Token_Decoder_Layers>\d+))?"  # Optional token decoder layers
-        r"(?:.*?reduction_strategy=(?P<Reduction_Strategy>[^_]+(?:\.[^_]+)?))?"  # Optional reduction strategy
-        r"(?:.*?layers=(?P<Concept_Decoder_Layers>\d+))?"  # Optional concept decoder layers
-        r"(?:.*?learning_rate=(?P<Learning_Rate>[\d.]+))?"  # Optional learning rate
-        r"(?:.*?n_kv=(?P<Attention_Heads>\d+))?"  # Optional n_kv
-        r"(?:.*?n_q_per_kv=(?P<Query_Per_Key_Value>\d+))?"  # Optional n_q_per_kv
-    )
 
     # Parse the data
     data = []
@@ -164,30 +169,25 @@ def get_eval_metrics_table(metrics_data):
             loss = float(d["final_loss"][0])
 
             # Match the name string with the regex pattern
-            match = pattern.search(name)
-            if match:
-                fields = match.groupdict()
-                # Convert numerical fields to appropriate types
-                for key in [
-                    "Block_Size",
-                    "Encoder_Layers",
-                    "Token_Decoder_Layers",
-                    "Concept_Decoder_Layers",
-                    "Attention_Heads",
-                    "Query_Per_Key_Value",
-                ]:
-                    if fields[key] is not None:
-                        fields[key] = int(fields[key])
-                if fields["Learning_Rate"] is not None:
-                    fields["Learning_Rate"] = float(fields["Learning_Rate"])
+            fields = {}
+            config_fields = config_data[guid]
+            # Convert numerical fields to appropriate types
 
-                data.append(
-                    {
-                        "Name": name,
-                        "Eval Loss": loss,
-                        **fields,
-                    }
-                )
+            for config_key, display_key in TRACKED_FIELDS:
+                if config_key in config_fields:
+                    if config_key == "learning_rate":
+                        fields[display_key] = float(config_fields[config_key])
+                    elif config_key == "reduction_strategy":
+                        fields[display_key] = config_fields[config_key]
+                    else:
+                        fields[display_key] = int(config_fields[config_key])
+            data.append(
+                {
+                    "Name": name,
+                    "Eval Loss": loss,
+                    **fields,
+                }
+            )
 
     # Create DataFrame
     df = pd.DataFrame(data)

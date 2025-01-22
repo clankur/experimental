@@ -1,10 +1,6 @@
-# mugpt
+# lcm
 
-mugpt is a fork of [seqax by MatX](https://github.com/MatX-inc/seqax) modified to run on Google's TPU v4-32s and uses the hyperparameter transfer described by [Everett et al.](https://arxiv.org/pdf/2407.05872v2) Previously, I experimented with a modified form of attention "SharedKV" which resides in the [sharedkv branch](https://github.com/clankur/mugpt/tree/shared_kv) as well as mu-parameter transfer described by [Yang et al.](https://arxiv.org/pdf/2203.03466) For more information on these investigations, take a look here:
-
-- [Benchmarking Learning Rate Transfer](./docs/exp_scaling.md)
-- [Minimizing HBM usage through SharedKV](./docs/sharedkv.md)
-- [Exploring the best approaches for implementing muP](./docs/mup.md)
+lcm is a fork of [seqax by MatX](https://github.com/MatX-inc/seqax) modified to run on Google's TPU v4-32s and and uses the framework outlined by Meta in [Large Concept Models](https://arxiv.org/pdf/2412.08821) as a technique to compress the KVCache. More details on the implementation and experiments can be read [here](./docs/lcm.ipynb).
 
 The installation procedure is identical to that described in [seqax](https://github.com/MatX-inc/seqax).
 

@@ -183,7 +183,7 @@ def get_eval_metrics_table(metrics_data, config_data):
                         fields[display_key] = int(config_fields[config_key])
             data.append(
                 {
-                    "Name": name,
+                    "Name": name if len(name) < 25 else name[:25] + "...",
                     "Eval Loss": loss,
                     **fields,
                 }

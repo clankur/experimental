@@ -15,7 +15,7 @@ The installation procedure is identical to that described in [seqax](https://git
 
 ### Run on CPU for local development
 
-For development and testing you can run on CPU. Typically you'd use our synthetic dataset (which is [checked into this repository](/synthetic_dataset.zarr)) or the [Huggingface data loader](#data-loaders) and you'd set XLA flags to simulate multiple devices so as to test that parallelism is working as intended:
+For development and testing you can run on CPU. Typically you'd use our synthetic dataset (which is [checked into this repository](/synthetic_dataset.zarr)) or the [Huggingface data loader](./input_loader.py#L355) and you'd set XLA flags to simulate multiple devices so as to test that parallelism is working as intended:
 
 ```bash
 XLA_FLAGS=--xla_force_host_platform_device_count=8 python -m train --config-name=local_test_synthetic +paths.model_name=synthetic_000

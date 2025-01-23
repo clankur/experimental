@@ -51,26 +51,59 @@ def exponential_moving_average(data, alpha=0.03):
     return ema
 
 
+def get_git_hash() -> str:
+    """Get the current git commit hash."""
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
+    except subprocess.CalledProcessError:
+        return ""
+
+
+def find_existing_experiment(
+    model_name: str,
+    params: Dict,
+) -> Optional[Tuple[float, float, str]]:
+    """Find an existing experiment with the same configuration."""
+    # TODO: figure out how to get the version_num from ClearML
+    return None
+
+
 def train_model(
     params: Dict, template_id: str, queue_name: str, model_name: str
-) -> Tuple[float, str]:
+) -> Tuple[float, float, str]:
     """Train a model with given parameters and return its loss and task ID."""
-    # Clone the template task and override the parameters
+    # First check if we have an existing experiment
+    existing_result = find_existing_experiment(model_name, params)
+    if existing_result is not None:
+        return existing_result
+
+    # If no existing experiment, proceed with training
     param_str = "_".join(f"{k}:{v}" for k, v in params.items())
     child_task: Task = Task.clone(
         source_task=template_id,
         name=f"{model_name}_{param_str}",
     )
     child_task.set_system_tags([])
+    child_task.set_parameter("Hydra/git_hash", get_git_hash())
 
     # Set all parameters
     for key, value in params.items():
         if key == "learning_rate":
             child_task.set_parameter("Hydra/training.learning_rate", value)
         elif key == "d_model":
-            child_task.set_parameter("Hydra/base.d_model", value)
+            child_task.set_parameter("Hydra/model.d_model", value)
+            child_task.set_parameter("Hydra/model.base.d_model", value)
         elif key == "d_ff":
-            child_task.set_parameter("Hydra/base.d_ff", value)
+            child_task.set_parameter("Hydra/model.d_ff", value)
+            child_task.set_parameter("Hydra/model.base.d_ff", value)
+
+    child_task.set_parameter("Hydra/variant", "arch_sweep")
 
     print(f"Training model with parameters: {params}")
     Task.enqueue(child_task.id, queue_name=queue_name)
@@ -79,8 +112,11 @@ def train_model(
     # Get the loss from the child task
     scalars = child_task.get_reported_scalars()
     loss = scalars["loss"]["loss"]["y"]
-    eval_loss = scalars["final_loss"]["loss"]["y"][-1]
     smoothed_loss = exponential_moving_average(loss, alpha=1 - 0.97)
+    if "final_loss" in scalars:
+        eval_loss = scalars["final_loss"]["eval"]["y"][-1]
+    else:  # early termination
+        eval_loss = smoothed_loss[-1]
     return eval_loss, smoothed_loss[-1], child_task.id
 
 
@@ -90,13 +126,29 @@ def architecture_sweep(
     queue_name: str,
     template_id: str,
     d_models: List[int] = [256, 384, 512],
-    d_ff_multipliers: List[int] = [4, 8, 12],
-    learning_rates: List[float] = [5e-3, 1e-2, 2.5e-2, 3e-2, 5e-2],
+    d_ff_multipliers: List[int] = [4, 8, 12, 16],
+    lr_range: Tuple[float, float] = (7.5e-3, 2.5e-2),
+    lr_points: int = 8,
 ) -> Dict:
     """
     Perform a sweep over d_model, d_ff, and learning rate configurations.
     Returns the best configuration found.
+    Early stops exploring learning rates for an architecture if loss gets worse.
+
+    Args:
+        lr_range: Tuple of (min_lr, max_lr) to explore
+        lr_points: Number of learning rate points to try within the range
     """
+    # Generate learning rates with logarithmic spacing
+    min_lr, max_lr = lr_range
+    learning_rates = [
+        float(f"{lr:.6f}")
+        for lr in np.logspace(
+            np.log10(min_lr), np.log10(max_lr), num=lr_points
+        ).tolist()
+    ]
+    print(f"Generated learning rates: {[f'{lr:.6f}' for lr in learning_rates]}")
+
     project_name = f"{config_name}/arch_sweep"
     task_name = f"{model_name}_arch_sweep_{datetime.now().strftime('%Y%m%d_%H%M')}"
     parent_task = Task.init(project_name=project_name, task_name=task_name)
@@ -121,6 +173,9 @@ def architecture_sweep(
                 "best_loss": float("inf"),
             }
 
+            # Track architecture-specific best loss
+            arch_best_loss = float("inf")
+
             for lr in learning_rates:
                 params = {"d_model": d_model, "d_ff": d_ff, "learning_rate": lr}
 
@@ -142,6 +197,10 @@ def architecture_sweep(
                     best_loss = loss
                     best_config = params
 
+                # Update architecture-specific best loss
+                if loss < arch_best_loss:
+                    arch_best_loss = loss
+
                 # Store results for this architecture configuration
                 arch_results[arch_key]["lr_results"].append({"lr": lr, "loss": loss})
                 if loss < arch_results[arch_key]["best_loss"]:
@@ -157,19 +216,25 @@ def architecture_sweep(
 
                 # 2. Architecture-specific metrics
                 logger.report_scalar(
-                    f"arch_{arch_key}/loss", "value", loss, iteration=iteration
+                    f"arch_{arch_key}/loss", "loss", loss, iteration=iteration
+                )
+                logger.report_scalar(
+                    f"arch_{arch_key}/loss",
+                    "best_loss",
+                    arch_results[arch_key]["best_loss"],
+                    iteration=iteration,
                 )
                 logger.report_scalar(
                     f"arch_{arch_key}/learning_rate", "value", lr, iteration=iteration
                 )
-                logger.report_scalar(
-                    f"arch_{arch_key}/best_loss",
-                    "value",
-                    arch_results[arch_key]["best_loss"],
-                    iteration=iteration,
-                )
 
                 iteration += 1
+
+                # Early stopping: Stop if loss gets worse than previous iteration
+                if loss > arch_best_loss:
+                    print(f"Early stopping for {arch_key} at lr={lr:.6f}")
+                    print(f"Loss increased: {loss:.6f} > {arch_best_loss:.6f}")
+                    break
 
             # Print current iteration results
             print(

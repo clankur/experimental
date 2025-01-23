@@ -1,4 +1,5 @@
 import time
+import yaml
 from clearml import Task
 import numpy as np
 import hydra
@@ -66,11 +67,25 @@ def get_git_hash() -> str:
 
 
 def find_existing_experiment(
-    model_name: str,
     params: Dict,
+    filter_by_hash: bool = True,
 ) -> Optional[Tuple[float, float, str]]:
     """Find an existing experiment with the same configuration."""
-    # TODO: figure out how to get the version_num from ClearML
+    # TODO: figure out how to get the version_num/githash from ClearML
+    task_filter = {"system_tags": ["-multi_node_instance"]}
+    tags = [f"git_hash={get_git_hash()}"] if filter_by_hash else []
+    tasks = Task.get_tasks(task_filter=task_filter, tags=tags)
+
+    for task in tasks:
+        print(task.get_last_iteration())
+        yaml_config = task.get_configuration_object("OmegaConf")
+        config = yaml.safe_load(yaml_config)
+
+        if all(
+            k in config["model"] and config["model"][k] == v for k, v in params.items()
+        ):
+            print(f"Found existing experiment {task.id}")
+            return task
     return None
 
 
@@ -79,9 +94,9 @@ def train_model(
 ) -> Tuple[float, float, str]:
     """Train a model with given parameters and return its loss and task ID."""
     # First check if we have an existing experiment
-    existing_result = find_existing_experiment(model_name, params)
+    existing_result = find_existing_experiment(params)
     if existing_result is not None:
-        return existing_result
+        return get_task_metrics(existing_result)
 
     # If no existing experiment, proceed with training
     param_str = "_".join(f"{k}:{v}" for k, v in params.items())
@@ -108,16 +123,18 @@ def train_model(
     print(f"Training model with parameters: {params}")
     Task.enqueue(child_task.id, queue_name=queue_name)
     child_task.wait_for_status(check_interval_sec=120)
+    return get_task_metrics(child_task)
 
-    # Get the loss from the child task
-    scalars = child_task.get_reported_scalars()
+
+def get_task_metrics(task: Task) -> Dict:
+    scalars = task.get_reported_scalars()
     loss = scalars["loss"]["loss"]["y"]
     smoothed_loss = exponential_moving_average(loss, alpha=1 - 0.97)
     if "final_loss" in scalars:
         eval_loss = scalars["final_loss"]["eval"]["y"][-1]
     else:  # early termination
         eval_loss = smoothed_loss[-1]
-    return eval_loss, smoothed_loss[-1], child_task.id
+    return eval_loss, smoothed_loss[-1], task.id
 
 
 def architecture_sweep(

@@ -103,16 +103,6 @@ class Hparams:
 
 
 @pytree_dataclass
-class GlobalStats:
-    max: f32[b""]
-    min: f32[b""]
-    mean: f32[b""]
-    abs_max: f32[b""]
-    abs_mean: f32[b""]
-    norm: f32[b""]
-
-
-@pytree_dataclass
 class Stats:
     max: f32[b""]
     min: f32[b""]
@@ -125,8 +115,6 @@ class Stats:
 # TODO: add per head stats
 
 
-# Add stats function
-# loop metrics is just a dict of stats
 # precision: retrieval mask - use a threshold for the queries
 
 
@@ -149,7 +137,7 @@ StatsDict = dict[str, Stats]
 class CumulativeStatsDict:
     """Accumulates StatsDict over multiple steps."""
 
-    stats: Dict[str, GlobalStats]
+    stats: Dict[str, Stats]
     count: int = 0
 
     @staticmethod
@@ -162,7 +150,7 @@ class CumulativeStatsDict:
         else:
             for k, v in other.items():
                 if k in self.stats:
-                    self.stats[k] = GlobalStats(
+                    self.stats[k] = Stats(
                         max=self.stats[k].max + v.max,
                         min=self.stats[k].min + v.min,
                         mean=self.stats[k].mean + v.mean,
@@ -180,7 +168,7 @@ class CumulativeStatsDict:
 
         averaged_stats = {}
         for k, v in self.stats.items():
-            averaged_stats[k] = GlobalStats(
+            averaged_stats[k] = Stats(
                 max=v.max / self.count,
                 min=v.min / self.count,
                 mean=v.mean / self.count,
@@ -569,12 +557,6 @@ class Model:
                 jax.lax.stop_gradient(nk),
                 k_clusters,
             )
-            # get stats for k_clusters/q clusters
-            stats["q_clusters"] = get_stats(q_clusters)
-            stats["k_clusters"] = get_stats(k_clusters)
-
-            stats["q_c_raw"] = get_stats(q_c)
-            stats["k_c_raw"] = get_stats(k_c)
             # temp = 0.01 + 20 * (jnp.float32(step) / jnp.float32(total_steps))
             q_bias = einops.rearrange(
                 layer_weights.q_bias, "n_clusters Q K -> Q K n_clusters"
@@ -625,11 +607,13 @@ class Model:
             )
             stats["min_max_qk_alignment"] = get_stats(min_max_qk_alignment)
             stats["logits"] = get_stats(logits)
-            max_logits = einops.reduce(logits, "B Qlen Klen Q K -> B Qlen 1 Q K", "max")
+            max_logits = jnp.maximum(
+                einops.reduce(logits, "B Qlen Klen Q K -> B Qlen 1 Q K", "max"), 0.0
+            )
             probs = jnp.bfloat16(
                 (jnp.exp(logits - max_logits))
                 / (
-                    1
+                    jnp.exp(-max_logits)
                     + einops.reduce(
                         (jnp.exp(logits - max_logits)),
                         "B Qlen Klen Q K -> B Qlen 1 Q K",

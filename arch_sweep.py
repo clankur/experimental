@@ -75,15 +75,17 @@ def find_existing_experiment(
     task_filter = {"system_tags": ["-multi_node_instance"]}
     tags = [f"git_hash={get_git_hash()}"] if filter_by_hash else []
     tasks = Task.get_tasks(task_filter=task_filter, tags=tags)
-
     for task in tasks:
-        print(task.get_last_iteration())
+        # TODO: add check if task.get_last_iteration() < model.steps
         yaml_config = task.get_configuration_object("OmegaConf")
         config = yaml.safe_load(yaml_config)
-
-        if all(
-            k in config["model"] and config["model"][k] == v for k, v in params.items()
-        ):
+        scalars = task.get_reported_scalars()
+        same_params = all(
+            (k in config["model"] and config["model"][k] == v)
+            or (k in config["training"] and config["training"][k] == v)
+            for k, v in params.items()
+        )
+        if same_params and "loss" in scalars:
             print(f"Found existing experiment {task.id}")
             return task
     return None
@@ -226,9 +228,9 @@ def architecture_sweep(
 
                 # Log metrics in multiple ways
                 # 1. Overall metrics
-                logger.report_scalar("overall/loss", "value", loss, iteration=iteration)
+                logger.report_scalar("overall/loss", "loss", loss, iteration=iteration)
                 logger.report_scalar(
-                    "overall/best_loss", "value", best_loss, iteration=iteration
+                    "overall/loss", "best_loss", best_loss, iteration=iteration
                 )
 
                 # 2. Architecture-specific metrics

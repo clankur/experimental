@@ -569,6 +569,12 @@ class Model:
                 jax.lax.stop_gradient(nk),
                 k_clusters,
             )
+            # get stats for k_clusters/q clusters
+            stats["q_clusters"] = get_stats(q_clusters)
+            stats["k_clusters"] = get_stats(k_clusters)
+
+            stats["q_c_raw"] = get_stats(q_c)
+            stats["k_c_raw"] = get_stats(k_c)
             # temp = 0.01 + 20 * (jnp.float32(step) / jnp.float32(total_steps))
             q_bias = einops.rearrange(
                 layer_weights.q_bias, "n_clusters Q K -> Q K n_clusters"

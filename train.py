@@ -314,6 +314,9 @@ class TransformerLayer:
     q_clusters: f32["n_clusters n_q_per_kv n_kv/t d_head/d"]
     k_clusters: f32["n_clusters n_kv/t d_head/d"]
     q_bias: f32["n_clusters n_q_per_kv n_kv/t"]
+    q_mlp_up: f32["d_head/d d_ff/t"]
+    q_mlp_gate: f32["d_head/d d_ff/t"]
+    q_mlp_down: f32["d_head/d d_ff/t"]
 
 
 Transformer = Array["layers", TransformerLayer]
@@ -423,6 +426,27 @@ class Model:
             (h.layers, h.n_clusters, h.n_kv, h.d_head),
             dtype=jnp.float32,
         )
+        q_mlp_up = jax.random.truncated_normal(
+            fold_in_str(rng, "q_mlp_up"),
+            -2,
+            2,
+            (h.layers, h.d_head, h.d_ff),
+            dtype=jnp.float32,
+        )
+        q_mlp_gate = jax.random.truncated_normal(
+            fold_in_str(rng, "q_mlp_gate"),
+            -2,
+            2,
+            (h.layers, h.d_head, h.d_ff),
+            dtype=jnp.float32,
+        )
+        q_mlp_down = jax.random.truncated_normal(
+            fold_in_str(rng, "q_mlp_down"),
+            -2,
+            2,
+            (h.layers, h.d_head, h.d_ff),
+            dtype=jnp.float32,
+        )
 
         arrays = Model(
             embed=embed,
@@ -439,6 +463,9 @@ class Model:
                 q_clusters=q_clusters,
                 k_clusters=k_clusters,
                 q_bias=q_bias,
+                q_mlp_up=q_mlp_up,
+                q_mlp_gate=q_mlp_gate,
+                q_mlp_down=q_mlp_down,
             ),
             final_layer_norm=final_layer_norm,
         )
@@ -549,9 +576,39 @@ class Model:
             stats["nq"] = get_stats(jnp.float32(nq))
             stats["nk"] = get_stats(jnp.float32(nk))
 
+            # Apply MLP to normalized queries before cluster computation
+            q_mlp_up = shardops.all_gather(
+                "d_head/d d_ff/t -> d_head d_ff", jnp.bfloat16(layer_weights.q_mlp_up)
+            )
+            q_mlp_gate = shardops.all_gather(
+                "d_head/d d_ff/t -> d_head d_ff", jnp.bfloat16(layer_weights.q_mlp_gate)
+            )
+            q_mlp_down = shardops.all_gather(
+                "d_head/d d_ff/t -> d_head d_ff", jnp.bfloat16(layer_weights.q_mlp_down)
+            )
+
+            # Apply SwiGLU MLP to normalized queries
+            gate_proj = shardops.einsum_unreduced(
+                "B/d L Q K/t D, D d_ff -> B/d L Q K/t d_ff",
+                nq,
+                q_mlp_gate,
+            )
+            up_proj = shardops.einsum_unreduced(
+                "B/d L Q K/t D, D d_ff -> B/d L Q K/t d_ff",
+                nq,
+                q_mlp_up,
+            )
+            mlp_hidden = jax.nn.swish(gate_proj) * up_proj
+            nq_processed = shardops.einsum_unreduced(
+                "B/d L Q K/t d_ff, D d_ff -> B/d L Q K/t D",
+                mlp_hidden,
+                q_mlp_down,
+            )
+            stats["nq_processed"] = get_stats(nq_processed)
+
             q_c = shardops.einsum_unreduced(
                 "B/d L Q K/t D, n_clusters Q K/t D -> B/d L Q K/t n_clusters",
-                jax.lax.stop_gradient(nq),
+                jax.lax.stop_gradient(nq_processed),
                 q_clusters,
             )
 
@@ -1106,6 +1163,9 @@ def training_step(
                 q_clusters=1.0,
                 k_clusters=1.0,
                 q_bias=1.0,
+                q_mlp_up=1.0,
+                q_mlp_gate=1.0,
+                q_mlp_down=1.0,
             ),
             final_layer_norm=1.0,
         )

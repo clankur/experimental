@@ -579,7 +579,14 @@ class Model:
             # q_c = what cluster clusters matter
             # k_c = whats the most important cluster
             # softmask = soft selection of clusters based on q_c-k_c alignment
-            softmask = stable_sigmoid_softmax_einsum(q_c, k_c)
+            softmask = (
+                shardops.einsum_unreduced(
+                    "B/d Qlen Q K/t n_clusters, B/d Klen K/t n_clusters -> B/d Qlen Klen Q K/t",
+                    q_c,
+                    k_c,
+                )
+                * causal_mask
+            )
             stats["softmask"] = get_stats(softmask)
 
             logit_scale = jax.lax.select(
@@ -628,11 +635,13 @@ class Model:
             # apply softmask
             apply_softmask = step >= h.softmask_start_fraction * total_steps
             apply_hardmask = step >= h.hardmask_start_fraction * total_steps
-            softmask_probs = jax.lax.stop_gradient(probs) * softmask
-            cluster_recall = einops.reduce(
-                softmask_probs, "B Qlen Klen Q K -> B Qlen Q K", "sum"
+            softmask_probs = jnp.bfloat16(jax.lax.stop_gradient(probs) * softmask)
+            cluster_recall = jnp.sum(
+                softmask_probs, axis=2, dtype=jnp.float32
             )  # how much of the total probability we recall after masking
-            soft_prob_ratio = cluster_recall / total_probs
+            soft_prob_ratio = jnp.where(
+                total_probs > 0, cluster_recall / total_probs, 0
+            )
             softmask_keys_retrieved = einops.reduce(
                 softmask, "B Qlen Klen Q K -> B Qlen Q K", "sum"
             )  # approximating the number of keys retrieved
@@ -642,11 +651,11 @@ class Model:
                 0.0,
             )
             stats["cluster_recall"] = get_stats(cluster_recall)
-            stats["log_cluster_recall"] = get_stats(jnp.log(cluster_recall))
+            stats["log_cluster_recall"] = get_stats(jnp.log(cluster_recall + 1e-6))
             stats["soft_prob_ratio"] = get_stats(soft_prob_ratio)
             stats["softmask_keys_retrieved"] = get_stats(softmask_keys_retrieved)
             stats["log_softmask_keys_retrieved"] = get_stats(
-                jnp.log(softmask_keys_retrieved)
+                jnp.log(softmask_keys_retrieved + 1e-6)
             )
             stats["cluster_recall_per_key"] = get_stats(cluster_recall_per_key)
             probs = jax.lax.select(apply_softmask, jnp.bfloat16(softmask_probs), probs)
@@ -655,7 +664,7 @@ class Model:
             )
             stats["soft_retrieved_percent"] = get_stats(soft_retrieved_percent)
             stats["log_soft_retrieved_percent"] = get_stats(
-                jnp.log(soft_retrieved_percent)
+                jnp.log(soft_retrieved_percent + 1e-6)
             )
             k_cluster_selection = jnp.argmax(k_c, axis=-1)
             hard_k_c = jax.nn.one_hot(k_cluster_selection, h.n_clusters)
@@ -670,11 +679,12 @@ class Model:
                 )
                 * causal_mask
             )
-            hardmask_probs = probs * hardmask
-            hard_cluster_recall = einops.reduce(
-                hardmask_probs, "B Qlen Klen Q K -> B Qlen Q K", "sum"
+            hardmask_probs = jnp.bfloat16(probs * hardmask)
+            probs = jax.lax.select(apply_hardmask, hardmask_probs, probs)
+            hard_cluster_recall = jnp.sum(softmask_probs, axis=2, dtype=jnp.float32)
+            hard_prob_ratio = jnp.where(
+                total_probs > 0, hard_cluster_recall / total_probs, 0
             )
-            hard_prob_ratio = hard_cluster_recall / total_probs
             hardmask_keys_retrieved = einops.reduce(
                 hardmask, "B Qlen Klen Q K -> B Qlen Q K", "sum"
             )
@@ -683,9 +693,7 @@ class Model:
                 hard_cluster_recall / hardmask_keys_retrieved,
                 0.0,
             )
-            stats["hard_cluster_recall"] = get_stats(
-                hard_cluster_recall.astype(jnp.float32)
-            )
+            stats["hard_cluster_recall"] = get_stats(hard_cluster_recall)
             stats["hard_prob_ratio"] = get_stats(hard_prob_ratio)
             stats["hard_cluster_recall_per_key"] = get_stats(
                 hard_cluster_recall_per_key
@@ -829,57 +837,28 @@ class Model:
         )
 
 
-@custom_gradient
-def stable_sigmoid_softmax_einsum(q_c, k_c):
-    """
-    q_c: [B, Qlen, Q, K/t, n_clusters]  (sigmoid output)
-    k_c: [B, Klen, K/t, n_clusters]     (softmax output along n_clusters)
-    Returns shape: [B, Qlen, Klen, Q, K/t]
-    """
-    # ----- Forward pass -----
-    out = shardops.einsum_unreduced(
-        "B/d Qlen Q K/t n_clusters, B/d Klen K/t n_clusters -> B/d Qlen Klen Q K/t",
-        q_c,
-        k_c,
-    )
+@pytree_dataclass
+class Alibi:
+    slopes: f32["K/t"]
 
-    def backward(dout):
-        # dout has shape [B, Qlen, Klen, Q, K/t]
+    def create(hparams: Hparams) -> "Alibi":
+        n_kv = hparams.n_kv
+        start = 2.0 ** (-(2.0 ** -(jnp.log2(n_kv) - 3)))
+        slopes = start * (start ** shardops.arange("t", n_kv))
 
-        # ----------------------------
-        # 1) Partial derivative wrt q_c
-        # ----------------------------
-        # Reverse einsum to get partial wrt q_c:
-        #   "B/d Qlen Klen Q K/t, B/d Klen K/t n_clusters -> B/d Qlen Q K/t n_clusters"
-        partial_q_c = shardops.einsum_unreduced(
-            "B/d Qlen Klen Q K/t, B/d Klen K/t n_clusters -> B/d Qlen Q K/t n_clusters",
-            dout,
-            k_c,
+        return Alibi(slopes=slopes)
+
+    def apply(self, logits: f32["B/d Qlen Klen Q K/t"]) -> f32["1 Qlen Klen 1 K/t"]:
+        Qlen = logits.shape[1]
+        slopes = einops.rearrange(self.slopes, "K -> 1 1 1 K")
+
+        position_bias = jnp.arange(Qlen)[None, :] - jnp.arange(Qlen)[:, None]
+        position_bias = einops.rearrange(position_bias, "Qlen Klen -> Qlen Klen 1 1")
+
+        bias: f32["1 Qlen Klen 1 K/t"] = einops.rearrange(
+            position_bias * slopes, "Qlen Klen 1 K -> 1 Qlen Klen 1 K"
         )
-        # chain rule for q_c = sigmoid(...) => d/d(raw_q) = partial_q_c * q_c*(1 - q_c)
-        dq_c = partial_q_c * (q_c * (1.0 - q_c))
-
-        # ----------------------------
-        # 2) Partial derivative wrt k_c
-        # ----------------------------
-        #
-        # Reverse einsum to get partial wrt k_c:
-        #   "B/d Qlen Klen Q K/t, B/d Qlen Q K/t n_clusters -> B/d Klen K/t n_clusters"
-        partial_k_c = shardops.einsum_unreduced(
-            "B/d Qlen Klen Q K/t, B/d Qlen Q K/t n_clusters -> B/d Klen K/t n_clusters",
-            dout,
-            q_c,
-        )
-        #
-        # chain rule for k_c = softmax(...) along n_clusters
-        #   Let s = k_c, p = partial_k_c
-        #   => dk_c = s * [ p - sum_{n_clusters} (p * s) ]
-        sum_ps = jnp.sum(partial_k_c * k_c, axis=-1, keepdims=True)
-        dk_c = k_c * (partial_k_c - sum_ps)
-
-        return dq_c, dk_c
-
-    return out, backward
+        return logits + bias
 
 
 @pytree_dataclass
@@ -1402,6 +1381,20 @@ def main_contained(config, logger):
             print(f"\nEvaluation Results:")
             print(f"Average Loss: {avg_loss:.4f}")
             print(f"Perplexity: {perplexity:.4f}")
+
+            if logger:
+                logger.report_scalar(
+                    series="eval",
+                    title="final_loss",
+                    value=avg_loss,
+                    iteration=config.training.steps,
+                )
+                logger.report_scalar(
+                    series="eval",
+                    title="final_perplexity",
+                    value=perplexity,
+                    iteration=config.training.steps,
+                )
 
 
 def clear_tpu_locks():

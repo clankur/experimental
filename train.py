@@ -75,7 +75,7 @@ class Hparams:
     n_kv: int
     d_head: int
     d_ff: int
-    n_clusters: int
+    n_partitions: int
 
     vocab: int
     layers: int
@@ -311,9 +311,9 @@ class TransformerLayer:
     w_gate: f32["d_model/d d_ff/t"]
     w_up: f32["d_model/d d_ff/t"]
     w_down: f32["d_model/d d_ff/t"]
-    q_clusters: f32["n_clusters n_q_per_kv n_kv/t d_head/d"]
-    k_clusters: f32["n_clusters n_kv/t d_head/d"]
-    q_bias: f32["n_clusters n_q_per_kv n_kv/t"]
+    w_q_gate: f32["n_partitions n_q_per_kv n_kv/t d_model/d"]
+    w_k_routing: f32["n_partitions n_kv/t d_model/d"]
+    q_bias: f32["n_partitions n_q_per_kv n_kv/t"]
 
 
 Transformer = Array["layers", TransformerLayer]
@@ -406,24 +406,31 @@ class Model:
                 dtype=jnp.float32,
             )
 
-        q_cluster_shape = (h.layers, h.n_clusters, h.n_q_per_kv, h.n_kv, h.d_head)
-        q_clusters = d_model_scale * jax.random.truncated_normal(
-            fold_in_str(rng, "q_clusters"),
+        # Initialize w_q_gate and w_k_routing with new shapes
+        w_q_gate_shape = (h.layers, h.n_partitions, h.n_q_per_kv, h.n_kv, h.d_model)
+        w_q_gate = d_model_scale * jax.random.truncated_normal(
+            fold_in_str(rng, "w_q_gate"),
             -2,
             2,
-            q_cluster_shape,
-            dtype=jnp.float32,
-        )
-        q_bias = jnp.ones(q_cluster_shape[:-1], dtype=jnp.float32)
-
-        k_clusters = d_model_scale * jax.random.truncated_normal(
-            fold_in_str(rng, "k_clusters"),
-            -2,
-            2,
-            (h.layers, h.n_clusters, h.n_kv, h.d_head),
+            w_q_gate_shape,
             dtype=jnp.float32,
         )
 
+        w_k_routing_shape = (
+            h.layers,
+            h.n_partitions,
+            h.n_kv,
+            h.d_model,
+        )  # TODO: see if we want a query head
+        w_k_routing = d_model_scale * jax.random.truncated_normal(
+            fold_in_str(rng, "w_k_routing"),
+            -2,
+            2,
+            w_k_routing_shape,
+            dtype=jnp.float32,
+        )
+
+        q_bias = jnp.ones(w_q_gate_shape[:-1], dtype=jnp.float32)
         arrays = Model(
             embed=embed,
             unembed=unembed,
@@ -436,8 +443,8 @@ class Model:
                 w_gate=w_gate,
                 w_up=w_up,
                 w_down=w_down,
-                q_clusters=q_clusters,
-                k_clusters=k_clusters,
+                w_q_gate=w_q_gate,
+                w_k_routing=w_k_routing,
                 q_bias=q_bias,
             ),
             final_layer_norm=final_layer_norm,
@@ -525,64 +532,63 @@ class Model:
                 k = rope_table.apply("L d -> 1 L 1 d", k)
 
             # TODO:
-            # sigmoid (q_c + bias) # want them to select all the keys => pretty close to 1 at first
+            # sigmoid (q_gate + bias) # want them to select all the keys => pretty close to 1 at first
             # bias = vector * scale
             # METRIC: track bias decay over time
             # clusters are decaying over time, we can also decay it manually as a function of step
 
             # future ideas
-            # mini objectives along the way
             # have a loss based on based on the total probabilites from the loaded clusters
             # METRIC: average cum prob loaded
-
             # loss to penalize a cluster that is useless
 
-            q_clusters = shardops.all_gather(
-                "n_clusters Q K/t D/d -> n_clusters Q K/t D",
-                layer_weights.q_clusters,
+            w_q_gate = shardops.all_gather(
+                "n_partitions Q K/t M/d -> n_partitions Q K/t M",
+                layer_weights.w_q_gate,
             )
-            k_clusters = shardops.all_gather(
-                "n_clusters K/t D/d -> n_clusters K/t D", layer_weights.k_clusters
+            w_k_routing = shardops.all_gather(
+                "n_partitions K/t M/d -> n_partitions K/t M", layer_weights.w_k_routing
             )
-            nq = jnp.bfloat16(rms_norm(jnp.bfloat16(q)))
-            nk = jnp.bfloat16(rms_norm(jnp.bfloat16(k)))
-            stats["nq"] = get_stats(jnp.float32(nq))
-            stats["nk"] = get_stats(jnp.float32(nk))
-
-            q_c = shardops.einsum_unreduced(
-                "B/d L Q K/t D, n_clusters Q K/t D -> B/d L Q K/t n_clusters",
-                jax.lax.stop_gradient(nq),
-                q_clusters,
+            q_gate = shardops.einsum_unreduced(
+                "B/d L M, n_partitions Q K/t M -> B/d L Q K/t n_partitions",
+                jax.lax.stop_gradient(gx),
+                w_q_gate,
             )
-
-            k_c = shardops.einsum_unreduced(
-                "B/d L K/t D, n_clusters K/t D -> B/d L K/t n_clusters",
-                jax.lax.stop_gradient(nk),
-                k_clusters,
+            k_route = shardops.einsum_unreduced(
+                "B/d L M, n_partitions K/t M -> B/d L K/t n_partitions",
+                jax.lax.stop_gradient(gx),
+                w_k_routing,
             )
             # get stats for k_clusters/q clusters
-            stats["q_clusters"] = get_stats(q_clusters)
-            stats["k_clusters"] = get_stats(k_clusters)
 
             # temp = 0.01 + 20 * (jnp.float32(step) / jnp.float32(total_steps))
+            # TODO: add biases to q
             q_bias = einops.rearrange(
-                layer_weights.q_bias, "n_clusters Q K -> Q K n_clusters"
+                layer_weights.q_bias, "n_partitions Q K -> Q K n_partitions"
             )
-            q_c = jax.nn.sigmoid(q_c)
-            k_c = jax.nn.softmax(k_c, axis=-1)
-            # report q_c average to metrics
-            # q_c = what cluster clusters matter
+            # TODO: use incoming embeddings x instead of q
+            # q_gate = x * w_q_gate (query gate identifieis a subsec of the keys it wants)
+            # k_c = x * w_k_routing
+            # try with/without layernorm
+
+            # have a key/paritition gating on a per query basis and key routing function
+            q_gate = jax.nn.sigmoid(q_gate)
+            k_route = jax.nn.softmax(k_route, axis=-1)
+            # report q_gate average to metrics
+            # q_gate = what cluster clusters matter
             # k_c = whats the most important cluster
-            # softmask = soft selection of clusters based on q_c-k_c alignment
+            # softmask = soft selection of clusters based on q_gate-k_c alignment
             softmask = (
                 shardops.einsum_unreduced(
-                    "B/d Qlen Q K/t n_clusters, B/d Klen K/t n_clusters -> B/d Qlen Klen Q K/t",
-                    q_c,
-                    k_c,
+                    "B/d Qlen Q K/t n_partitions, B/d Klen K/t n_partitions -> B/d Qlen Klen Q K/t",
+                    q_gate,
+                    k_route,
                 )
                 * causal_mask
             )
             stats["softmask"] = get_stats(softmask)
+
+            # TODO: apply softmask/hardmask before softmax to probs
 
             logit_scale = jax.lax.select(
                 h.parameterization.lower() == "mup",
@@ -631,6 +637,7 @@ class Model:
             apply_softmask = step >= h.softmask_start_fraction * total_steps
             apply_hardmask = step >= h.hardmask_start_fraction * total_steps
             softmask_probs = jnp.bfloat16(jax.lax.stop_gradient(probs) * softmask)
+            # TODO: change recall to account for zero logit
             cluster_recall = einops.reduce(
                 softmask_probs.astype(jnp.float32),
                 "B Qlen Klen Q K -> B Qlen Q K",
@@ -660,16 +667,16 @@ class Model:
             stats["log_soft_retrieved_percent"] = get_stats(
                 jnp.log(soft_retrieved_percent + 1e-6)
             )
-            k_cluster_selection = jnp.argmax(k_c, axis=-1)
-            hard_k_c = jax.nn.one_hot(k_cluster_selection, h.n_clusters)
-            hard_q_c = (
-                q_c > h.hard_q_threshold
+            k_parition_selection = jnp.argmax(k_route, axis=-1)
+            hard_k_route = jax.nn.one_hot(k_parition_selection, h.n_partitions)
+            hard_q_gate = (
+                q_gate > h.hard_q_threshold
             )  # does this mean if no q clusters have >.5 the keys are entirely dropped despite selecting a cluster
             hardmask = (
                 shardops.einsum_unreduced(
-                    "B/d Qlen Q K/t n_clusters, B/d Klen K/t n_clusters -> B/d Qlen Klen Q K/t",
-                    hard_q_c,
-                    hard_k_c,
+                    "B/d Qlen Q K/t n_partitions, B/d Klen K/t n_partitions -> B/d Qlen Klen Q K/t",
+                    hard_q_gate,
+                    hard_k_route,
                 )
                 * causal_mask
             )
@@ -1060,8 +1067,8 @@ def training_step(
                 w_gate=h.gamma_hidden * (h.d_model / base.d_model) ** -p.hidden_lr,
                 w_up=h.gamma_hidden * (h.d_model / base.d_model) ** -p.hidden_lr,
                 w_down=h.gamma_hidden * (h.d_ff / base.d_ff) ** -p.hidden_lr,
-                q_clusters=1.0,
-                k_clusters=1.0,
+                w_q_gate=1.0,
+                w_k_routing=1.0,
                 q_bias=1.0,
             ),
             final_layer_norm=1.0,

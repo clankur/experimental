@@ -801,7 +801,10 @@ class Model:
         )
         tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
         ce_loss = -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
-        recall_loss = -stats_dict["log_cluster_recall"].mean
+        recall_loss = (
+            -stats_dict["log_cluster_recall"].mean
+            + 0.5 * stats_dict["log_soft_retrieved_percent"].mean
+        )
         total_loss = ce_loss + recall_loss
         return (
             total_loss,
@@ -879,6 +882,7 @@ def rms_norm(
     )
     return jnp.bfloat16(x * jax.lax.rsqrt(mean2 + 1e-6))
 
+
 def quiet_softmax(logits: f32["B Qlen Klen Q K"]) -> f32["B Qlen Klen Q K"]:
     """softmax with 0 logit padding, drop logits that have negative alignment"""
     max_logits = jnp.maximum(
@@ -894,6 +898,7 @@ def quiet_softmax(logits: f32["B Qlen Klen Q K"]) -> f32["B Qlen Klen Q K"]:
         )
     )
     return probs
+
 
 @pytree_dataclass
 class Metrics:

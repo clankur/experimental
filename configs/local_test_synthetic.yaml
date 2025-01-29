@@ -22,6 +22,7 @@ model:
   vocab: 1280 
   d_ff: 1024
   rope_max_timescale: 256
+  
   a_attn: 1
   a_output: 1
   zero_queries: true

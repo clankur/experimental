@@ -315,6 +315,10 @@ class TransformerLayer:
     w_k_routing: f32["n_partitions n_kv/t d_model/d"]
     q_bias: f32["n_partitions n_q_per_kv n_kv/t"]
 
+    partition_mlp_up: f32["d_head/d d_ff/t"]
+    partition_mlp_gate: f32["d_head/d d_ff/t"]
+    partition_mlp_down: f32["d_head/d d_ff/t"]
+
 
 Transformer = Array["layers", TransformerLayer]
 
@@ -415,6 +419,27 @@ class Model:
             w_q_gate_shape,
             dtype=jnp.float32,
         )
+        q_mlp_up = jax.random.truncated_normal(
+            fold_in_str(rng, "q_mlp_up"),
+            -2,
+            2,
+            (h.layers, h.d_head, h.d_ff),
+            dtype=jnp.float32,
+        )
+        q_mlp_gate = jax.random.truncated_normal(
+            fold_in_str(rng, "q_mlp_gate"),
+            -2,
+            2,
+            (h.layers, h.d_head, h.d_ff),
+            dtype=jnp.float32,
+        )
+        q_mlp_down = jax.random.truncated_normal(
+            fold_in_str(rng, "q_mlp_down"),
+            -2,
+            2,
+            (h.layers, h.d_head, h.d_ff),
+            dtype=jnp.float32,
+        )
 
         w_k_routing_shape = (
             h.layers,
@@ -446,6 +471,9 @@ class Model:
                 w_q_gate=w_q_gate,
                 w_k_routing=w_k_routing,
                 q_bias=q_bias,
+                q_mlp_up=q_mlp_up,
+                q_mlp_gate=q_mlp_gate,
+                q_mlp_down=q_mlp_down,
             ),
             final_layer_norm=final_layer_norm,
         )
@@ -549,9 +577,43 @@ class Model:
             w_k_routing = shardops.all_gather(
                 "n_partitions K/t M/d -> n_partitions K/t M", layer_weights.w_k_routing
             )
+
+            # TODO: Change chape of MLP to be M x d_ff
+            partition_mlp_up = shardops.all_gather(
+                "M/d d_ff/t -> M d_ff",
+                jnp.bfloat16(layer_weights.q_mlp_up),
+            )
+            partition_mlp_gate = shardops.all_gather(
+                "M/d d_ff/t -> M d_ff",
+                jnp.bfloat16(layer_weights.partition_mlp_gate),
+            )
+            partition_mlp_down = shardops.all_gather(
+                "M/d d_ff/t -> M d_ff",
+                jnp.bfloat16(layer_weights.partition_mlp_down),
+            )
+
+            # Apply SwiGLU MLP to normalized queries
+            gate_proj = shardops.einsum_unreduced(
+                "B/d L M, M d_ff -> B/d L d_ff",
+                gx,
+                partition_mlp_gate,
+            )
+            up_proj = shardops.einsum_unreduced(
+                "B/d L M, M d_ff -> B/d L d_ff",
+                gx,
+                partition_mlp_up,
+            )
+            hidden_out = jax.nn.swish(gate_proj) * up_proj
+            mlp_out = shardops.einsum_unreduced(
+                "B/d L d_ff, M d_ff -> B/d L M",
+                hidden_out,
+                partition_mlp_down,
+            )
+            stats["mlp_out"] = get_stats(mlp_out)
+
             q_gate = shardops.einsum_unreduced(
-                "B/d L M, n_partitions Q K/t M -> B/d L Q K/t n_partitions",
-                jax.lax.stop_gradient(gx),
+                "B/d L Q K/t D, n_clusters Q K/t D -> B/d L Q K/t n_clusters",
+                jax.lax.stop_gradient(mlp_out),
                 w_q_gate,
             )
             k_route = shardops.einsum_unreduced(
@@ -879,6 +941,7 @@ def rms_norm(
     )
     return jnp.bfloat16(x * jax.lax.rsqrt(mean2 + 1e-6))
 
+
 def quiet_softmax(logits: f32["B Qlen Klen Q K"]) -> f32["B Qlen Klen Q K"]:
     """softmax with 0 logit padding, drop logits that have negative alignment"""
     max_logits = jnp.maximum(
@@ -894,6 +957,7 @@ def quiet_softmax(logits: f32["B Qlen Klen Q K"]) -> f32["B Qlen Klen Q K"]:
         )
     )
     return probs
+
 
 @pytree_dataclass
 class Metrics:
@@ -1069,6 +1133,9 @@ def training_step(
                 w_q_gate=1.0,
                 w_k_routing=1.0,
                 q_bias=1.0,
+                partition_mlp_up=1.0,
+                partition_mlp_gate=1.0,
+                partition_mlp_down=1.0,
             ),
             final_layer_norm=1.0,
         )

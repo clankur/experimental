@@ -1012,9 +1012,7 @@ def clear_tpu_locks():
 def get_filtered_overrides():
     """Get filtered override strings from Hydra config, excluding certain overrides."""
     overrides = hydra.core.hydra_config.HydraConfig.get()["job"]["override_dirname"]
-    ignore_overrides = [
-        "training.queue",
-    ]
+    ignore_overrides = ["training.queue", "flat_tokens.filespec"]
     return [
         f"{override.lstrip('+').split('=')[0].split('.')[-1]}={override.split('=')[1]}"
         for override in overrides.split(",")

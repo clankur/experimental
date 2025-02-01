@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import re
+import yaml
 
 
 TRACKED_FIELDS = [
@@ -12,8 +13,9 @@ TRACKED_FIELDS = [
     ("n_t_layers", "Token_Decoder_Layers"),
     ("reduction_strategy", "Reduction_Strategy"),
     ("n_kv", "Attention_Heads"),
-    ("n_q_per_kv", "Query_Per_Key_Value"),
     ("learning_rate", "Learning_Rate"),
+    ("d_model", "d_model"),
+    ("d_ff", "d_ff"),
 ]
 
 
@@ -40,8 +42,12 @@ def get_metrics_data(task_ids):
     config_data = {}
     for task_id in task_ids:
         task = Task.get_task(task_id=task_id)
-        config = task.get_configuration_object_as_dict("OmegaConf")
-        config_data[task_id] = config
+        yaml_config = task.get_configuration_object("OmegaConf")
+        config = yaml.safe_load(yaml_config)
+
+        model_config = config["model"]
+        training_config = config["training"]
+        config_data[task_id] = {**model_config, **training_config}
         scalar_logs = task.get_reported_scalars()
         if "loss" not in scalar_logs:
             print(f"Loss not found for task {task_id} with name {task.name}")

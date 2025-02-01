@@ -423,7 +423,7 @@ class Model:
             if h.apply_alibi:
                 logits = alibi.apply(logits)
             logits = jnp.where(causal_mask, logits, -1e10)
-            probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
+            probs = jnp.bfloat16(quiet_softmax(logits))
             attn_out = shardops.einsum_unreduced(
                 "B/d Qlen Klen Q K/t, B/d Klen K/t D -> B/d Qlen Q K/t D", probs, v
             )
@@ -578,6 +578,23 @@ def rms_norm(x: bf16[b"batch/d len M"]) -> bf16[b"batch/d len M"]:
         jnp.mean(jax.lax.square(jnp.float32(x)), axis=-1, keepdims=True)
     )
     return jnp.bfloat16(x * jax.lax.rsqrt(mean2 + 1e-6))
+
+
+def quiet_softmax(logits: f32["B Qlen Klen Q K"]) -> f32["B Qlen Klen Q K"]:
+    """softmax with 0 logit padding, drop logits that have negative alignment"""
+    max_logits = jnp.maximum(
+        einops.reduce(logits, "B Qlen Klen Q K -> B Qlen 1 Q K", "max"), 0.0
+    )
+    stable_logits = logits - max_logits
+    probs = (jnp.exp(stable_logits)) / (
+        jnp.exp(-max_logits)
+        + einops.reduce(
+            jnp.exp(stable_logits),
+            "B Qlen Klen Q K -> B Qlen 1 Q K",
+            "sum",
+        )
+    )
+    return probs
 
 
 @pytree_dataclass

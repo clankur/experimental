@@ -889,6 +889,23 @@ def rms_norm(
     return jnp.bfloat16(x * jax.lax.rsqrt(mean2 + 1e-6))
 
 
+def quiet_softmax(logits: f32["B Qlen Klen Q K"]) -> f32["B Qlen Klen Q K"]:
+    """softmax with 0 logit padding, drop logits that have negative alignment"""
+    max_logits = jnp.maximum(
+        einops.reduce(logits, "B Qlen Klen Q K -> B Qlen 1 Q K", "max"), 0.0
+    )
+    stable_logits = logits - max_logits
+    probs = (jnp.exp(stable_logits)) / (
+        jnp.exp(-max_logits)
+        + einops.reduce(
+            jnp.exp(stable_logits),
+            "B Qlen Klen Q K -> B Qlen 1 Q K",
+            "sum",
+        )
+    )
+    return probs
+
+
 @pytree_dataclass
 class Metrics:
     loss: f32[b""]
@@ -1287,7 +1304,7 @@ def main_contained(config, logger):
                 model_params = jax.tree.reduce(
                     operator.add, jax.tree.map(lambda w: w.size, state.weights)
                 )
-                tokens = loader.load(step).targets.size
+                tokens = batch.targets.size
                 print(f"Model params: {model_params:_}")
                 print(f"Tokens: {tokens:_}")
                 device_flops = training_io.get_flops_per_device()
@@ -1376,9 +1393,7 @@ def clear_tpu_locks():
 def get_filtered_overrides():
     """Get filtered override strings from Hydra config, excluding certain overrides."""
     overrides = hydra.core.hydra_config.HydraConfig.get()["job"]["override_dirname"]
-    ignore_overrides = [
-        "training.queue",
-    ]
+    ignore_overrides = ["training.queue", "flat_tokens.filespec"]
     return [
         f"{override.lstrip('+').split('=')[0].split('.')[-1]}={override.split('=')[1]}"
         for override in overrides.split(",")

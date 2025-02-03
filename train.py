@@ -631,7 +631,7 @@ class Model:
             stats["relative_cluster_recall"] = get_stats(relative_cluster_recall)
             stats["log_cluster_recall"] = get_stats(jnp.log(cluster_recall + 1e-6))
             n_zero_attended_keys = einops.reduce(
-                jnp.where(softmask_keys_retrieved == 0, 1, 0),
+                softmask_keys_retrieved == 0,
                 "B Qlen Q K -> B Q K",
                 "sum",
             )

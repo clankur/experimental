@@ -531,6 +531,38 @@ class Model:
             if h.apply_rope:
                 k = rope_table.apply("L d -> 1 L 1 d", k)
 
+            logit_scale = jax.lax.select(
+                h.parameterization.lower() == "mup",
+                h.a_attn * math.sqrt(h.base.d_head) / h.d_head,
+                1.0 / math.sqrt(h.d_head),
+            )
+            logits = logit_scale * shardops.einsum_unreduced(
+                "B/d Qlen Q K/t D, B/d Klen K/t D -> B/d Qlen Klen Q K/t",
+                q,
+                k,
+                preferred_element_type=jnp.float32,
+            )
+            if h.apply_alibi:
+                logits = alibi.apply(logits)
+
+            # TODO: emit min of the max(query-key alignments)
+            logits = jnp.where(causal_mask, logits, -1e10)
+            max_qk_alignment = einops.reduce(
+                logits, "B Qlen Klen Q K -> B Qlen Q K", "max"
+            )
+            stats["max_qk_alignment"] = get_stats(max_qk_alignment)
+            min_max_qk_alignment = einops.reduce(
+                max_qk_alignment,
+                "B Qlen Q K -> B Q K",
+                "min",
+            )
+            stats["min_max_qk_alignment"] = get_stats(min_max_qk_alignment)
+            stats["logits"] = get_stats(logits)
+            probs = jnp.bfloat16(quiet_softmax(logits))
+            total_probs = jax.lax.stop_gradient(
+                einops.reduce(probs, "B Qlen Klen Q K -> B Qlen Q K", "sum")
+            )
+            # Partition routing
             w_q_gate = shardops.all_gather(
                 "n_partitions Q K/t D/d -> n_partitions Q K/t D",
                 layer_weights.w_q_gate,
@@ -573,37 +605,6 @@ class Model:
             )
             stats["softmask"] = get_stats(softmask)
 
-            logit_scale = jax.lax.select(
-                h.parameterization.lower() == "mup",
-                h.a_attn * math.sqrt(h.base.d_head) / h.d_head,
-                1.0 / math.sqrt(h.d_head),
-            )
-            logits = logit_scale * shardops.einsum_unreduced(
-                "B/d Qlen Q K/t D, B/d Klen K/t D -> B/d Qlen Klen Q K/t",
-                q,
-                k,
-                preferred_element_type=jnp.float32,
-            )
-            if h.apply_alibi:
-                logits = alibi.apply(logits)
-
-            # TODO: emit min of the max(query-key alignments)
-            logits = jnp.where(causal_mask, logits, -1e10)
-            max_qk_alignment = einops.reduce(
-                logits, "B Qlen Klen Q K -> B Qlen Q K", "max"
-            )
-            stats["max_qk_alignment"] = get_stats(max_qk_alignment)
-            min_max_qk_alignment = einops.reduce(
-                max_qk_alignment,
-                "B Qlen Q K -> B Q K",
-                "min",
-            )
-            stats["min_max_qk_alignment"] = get_stats(min_max_qk_alignment)
-            stats["logits"] = get_stats(logits)
-            probs = jnp.bfloat16(quiet_softmax(logits))
-            total_probs = jax.lax.stop_gradient(
-                einops.reduce(probs, "B Qlen Klen Q K -> B Qlen Q K", "sum")
-            )
             # apply softmask
             apply_softmask = step >= h.softmask_start_fraction * total_steps
             apply_hardmask = step >= h.hardmask_start_fraction * total_steps
@@ -627,7 +628,6 @@ class Model:
             stats["cluster_recall"] = get_stats(cluster_recall)
             stats["relative_cluster_recall"] = get_stats(relative_cluster_recall)
             stats["log_cluster_recall"] = get_stats(jnp.log(cluster_recall + 1e-6))
-            stats["softmask_keys_retrieved"] = get_stats(softmask_keys_retrieved)
             stats["cluster_recall_per_key"] = get_stats(cluster_recall_per_key)
             probs = jax.lax.select(apply_softmask, jnp.bfloat16(softmask_probs), probs)
             soft_retrieved_percent = softmask_keys_retrieved / jnp.sum(

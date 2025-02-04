@@ -247,10 +247,10 @@ class Model:
         ln2 = jnp.ones((h.layers, h.d_model), dtype=jnp.float32)
         final_layer_norm = jnp.ones((h.d_model,), dtype=jnp.float32)
 
-        # All of wi/wq/wo/wo/w_kv use truncated_normal initializers with 'fan_in' scaling,
-        # i.e. variance set to 1.0/fan_in.
-        # The constant is stddev of standard normal truncated to (-2, 2)
-        truncated_normal_stddev = 0.87962566103423978
+        # variance is set to 1.0 or 1/fan_in depending on parameterization
+        truncated_normal_stddev = (
+            1.0 if h.parameterization.lower() == "ntk" else 0.87962566103423978
+        )
         p = get_parameterization(h.parameterization)
         base = h.base
 
@@ -344,6 +344,7 @@ class Model:
         embed_mult = (h.d_model / h.base.d_model) ** -p.embed_param_mult
         hidden_mult = (h.d_model / h.base.d_model) ** -p.hidden_param_mult
         unembed_mult = (h.d_model / h.base.d_model) ** -p.unembed_param_mult
+        ffn_down_mult = (h.d_ff / h.base.d_ff) ** -p.hidden_param_mult
 
         # Initial embedding lookup.
         embed = embed_mult * shardops.all_gather(
@@ -453,7 +454,7 @@ class Model:
                 "M/d F/t -> M F/t", jnp.bfloat16(layer_weights.w_down)
             )
 
-            ffn_out_mult = (h.d_ff / h.base.d_ff) ** -p.hidden_param_mult
+            ffn_out_mult = ffn_down_mult
             ffn_out = ffn_out_mult * shardops.einsum_unreduced(
                 "B/d L F/t, M F/t -> B/d L M", y, w_down
             )

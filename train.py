@@ -1292,8 +1292,8 @@ def main_contained(config, logger):
 
 def train_phase(config, state, start_step, loader, model_dir, logger):
     """Training phase that can handle both regular and post-training."""
-    phase_name = "post-training" if config.training.is_post_training else "training"
-    print(f"Compiling {phase_name} step...")
+    phase_name = "post_train" if config.training.is_post_training else ""
+    model_dir = f"{model_dir}_{phase_name}" if phase_name else model_dir
 
     c_training_step = training_step.lower(
         state, jnp.uint32(0), config.model, config.training, loader.load(0)
@@ -1301,7 +1301,9 @@ def train_phase(config, state, start_step, loader, model_dir, logger):
 
     n_log_iterations = config.training.n_log_iterations or 5000
     log_interval = math.ceil(config.training.steps / n_log_iterations)
-    print(f"{phase_name.title()} phase log interval: {log_interval}")
+    print(
+        f"{phase_name if phase_name else 'training'} phase log interval: {log_interval}"
+    )
 
     cum_metrics = None
     cum_stats = None
@@ -1370,9 +1372,7 @@ def train_phase(config, state, start_step, loader, model_dir, logger):
             else:
                 cum_metrics = metrics
                 cum_stats = stats_dict
-            # Add prefix for post-training phase
-            prefix = "post_train_" if config.training.is_post_training else ""
-            training_io.log(step, logger, cum_metrics, cum_stats, prefix=prefix)
+            training_io.log(step, logger, cum_metrics, cum_stats, prefix=phase_name)
             cum_metrics = metrics
             cum_stats = CumulativeStatsDict.create()
             cum_stats.update(stats_dict)
@@ -1380,7 +1380,10 @@ def train_phase(config, state, start_step, loader, model_dir, logger):
             update_metrics(metrics, stats_dict)
 
     end_time = time.time()
-    print(f"{phase_name.title()} phase time: {end_time - start_time:.2f} seconds")
+    print(
+        f"{phase_name if phase_name else 'training'} phase time: {end_time - start_time:.2f} seconds"
+    )
+
     training_io.save_checkpoint(model_dir, config.training.steps, state, config.io)
     return state
 

@@ -8,7 +8,7 @@
 import jax
 import jax.numpy as jnp
 from jax.experimental import multihost_utils
-from typing import Tuple, Any
+from typing import Tuple, Any, Optional
 from dataclasses import dataclass
 import os
 import fsspec
@@ -46,7 +46,13 @@ class IOConfig:
     max_io_threads: int
 
 
-def log(step: int, logger: Logger, metrics: PyTree, stats_dict: PyTree = None):
+def log(
+    step: int,
+    logger: Logger,
+    metrics: PyTree,
+    stats_dict: PyTree = None,
+    prefix: str = "",
+):
     """Logs the output of a training step. The output must be a PyTree of f32 arrays."""
 
     if is_device_0():
@@ -57,6 +63,8 @@ def log(step: int, logger: Logger, metrics: PyTree, stats_dict: PyTree = None):
             if path not in path_map:
                 path_map[path] = (path, path)
             title, series = path_map[path]
+            title = f"{prefix}{title}" if prefix else title
+            series = f"{prefix}{series}" if prefix else series
             arr = jax.device_get(arr)
 
             if arr.shape == () and arr.dtype == jnp.float32:
@@ -91,10 +99,16 @@ def log(step: int, logger: Logger, metrics: PyTree, stats_dict: PyTree = None):
                 if "." in stat_name:
                     layer, stat_name = stat_name.split(".")
                     for stat_type, stat_value in vars(stat).items():
+                        title = (
+                            f"{prefix}{stat_name}.{stat_type}"
+                            if prefix
+                            else f"{stat_name}.{stat_type}"
+                        )
+                        series = f"{prefix}{layer}" if prefix else layer
                         if logger:
                             logger.report_scalar(
-                                title=f"{stat_name}.{stat_type}",
-                                series=f"{layer}",
+                                title=title,
+                                series=series,
                                 value=float(stat_value),
                                 iteration=step,
                             )
@@ -103,14 +117,16 @@ def log(step: int, logger: Logger, metrics: PyTree, stats_dict: PyTree = None):
                         )
                 else:
                     for stat_type, stat_value in vars(stat).items():
+                        title = f"{prefix}{stat_name}" if prefix else stat_name
+                        series = f"{prefix}{stat_type}" if prefix else stat_type
                         if logger:
                             logger.report_scalar(
-                                title=f"{stat_name}",
-                                series=stat_type,
+                                title=title,
+                                series=series,
                                 value=float(stat_value),
                                 iteration=step,
                             )
-                    metrics_dict[f"{stat_name}/{stat_type}"] = float(stat_value)
+                        metrics_dict[f"{stat_name}/{stat_type}"] = float(stat_value)
 
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if not logger:

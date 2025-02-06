@@ -917,6 +917,7 @@ class TrainingHparams:
     use_gpu: Optional[bool] = False
     use_single_worker: Optional[bool] = False
     use_multistage_training: Optional[bool] = False
+    is_post_training: Optional[bool] = False  # Flag to indicate post-training phase
 
 
 @pytree_dataclass
@@ -997,6 +998,36 @@ def training_step(
         # amount of data parallelism.
         #
         # So we reduce the loss across chips _outside_ the autodiff.
+
+        # If in post-training phase, zero out gradients for non-partitioning parameters
+        if hparams.is_post_training:
+            # Create a new transformer with zeroed gradients
+            zeroed_transformer = Transformer(
+                ln1=jnp.zeros_like(grad.transformer.ln1),
+                ln2=jnp.zeros_like(grad.transformer.ln2),
+                w_q=jnp.zeros_like(grad.transformer.w_q),
+                w_kv=jnp.zeros_like(grad.transformer.w_kv),
+                w_o=jnp.zeros_like(grad.transformer.w_o),
+                w_gate=jnp.zeros_like(grad.transformer.w_gate),
+                w_up=jnp.zeros_like(grad.transformer.w_up),
+                w_down=jnp.zeros_like(grad.transformer.w_down),
+                # Keep the partitioning parameters' gradients
+                w_q_gate=grad.transformer.w_q_gate,
+                w_k_routing=grad.transformer.w_k_routing,
+                q_bias=grad.transformer.q_bias,
+            )
+
+            # Replace the transformer gradients
+            grad = replace(grad, transformer=zeroed_transformer)
+
+            # Zero out embedding and unembedding gradients
+            grad = replace(
+                grad,
+                embed=jnp.zeros_like(grad.embed),
+                unembed=jnp.zeros_like(grad.unembed),
+                final_layer_norm=jnp.zeros_like(grad.final_layer_norm),
+            )
+
         loss = jax.lax.psum(loss, ("d", "t"))
         ce_loss = jax.lax.psum(ce_loss, ("d", "t"))
 
@@ -1232,125 +1263,160 @@ def main_contained(config, logger):
 
         start_time = time.time()
 
-        for step in range(start_step, config.training.steps):
-            if step % config.checkpoint_interval == 0 and step > start_step:
-                training_io.save_checkpoint(model_dir, step, state, config.io)
+        # Regular training phase
+        print("Starting main training phase...")
+        state = train_phase(config, state, start_step, loader, model_dir, logger)
 
-            # We profile on the second step, because the first step has a long pause for XLA
-            # compilation and initial shuffle buffer loading.
-            if training_io.is_device_0() and step == start_step + 1:
-                jax.block_until_ready(state)
-                training_io.start_profile()
-                profile_start = time.time()
+        # Evaluate after main training
+        print("Evaluating model after main training phase...")
+        evaluate_model(config, state, model_dir, logger, "main")
 
-            state, output = c_training_step(state, jnp.uint32(step), loader.load(step))
+        # Post-training phase for partitioning parameters
+        print("Starting post-training phase for partitioning parameters...")
+        post_train_config = replace(
+            config.training,
+            steps=config.training.steps
+            // 10,  # Shorter training phase for post-training
+            warmup_steps=config.training.warmup_steps // 10,
+            learning_rate=config.training.learning_rate
+            * 0.1,  # Lower learning rate for fine-tuning
+            is_post_training=True,  # Set the flag for post-training
+        )
+        post_train_config = replace(config, training=post_train_config)
+        state = train_phase(post_train_config, state, 0, loader, model_dir, logger)
 
-            # if half way point and multistage training is enabled, double seq length and halve batch size
-            if (
-                step == config.training.steps // 2
-                and config.training.use_multistage_training
-            ):
-                print("updating seq length and batch size")
-                tokens = replace(
-                    config.training.tokens,
-                    len=config.training.tokens.len * 2,
-                    batch=max(config.mesh.d, config.training.tokens.batch // 2),
-                )
-                config = replace(
-                    config, training=replace(config.training, tokens=tokens)
-                )
-                loader = get_loader(
-                    "train", config.training_data, config.training.tokens
-                )
-                c_training_step = training_step.lower(
-                    state,
-                    jnp.uint32(0),
-                    config.model,
-                    config.training,
-                    loader.load(step),
-                ).compile()
-
-            batch = loader.load(step)
-            state, (metrics, stats_dict) = c_training_step(
-                state, jnp.uint32(step), batch
-            )
-
-            # Run profile for two steps, to include data loading time in between them.
-            if training_io.is_device_0() and step == start_step + 2:
-                jax.block_until_ready(state)
-                profile_duration = time.time() - profile_start
-                training_io.stop_profile(model_dir)
-
-                # Print MFU, including (one step of) data loading time.
-                print(f"Profile time: {profile_duration}s for 2 steps.")
-                model_params = jax.tree.reduce(
-                    operator.add, jax.tree.map(lambda w: w.size, state.weights)
-                )
-                tokens = batch.targets.size
-                print(f"Model params: {model_params:_}")
-                print(f"Tokens: {tokens:_}")
-                device_flops = training_io.get_flops_per_device()
-                num_devices = jax.device_count()
-                print(
-                    f"MFU (projections only): {100 * (2 * 6 * model_params * tokens / (num_devices * profile_duration)) / device_flops:.2f}% MFU"
-                )
-
-            if step % log_interval == 0:
-                if cum_metrics:
-                    cum_metrics = Metrics(
-                        loss=cum_metrics.loss / log_interval,
-                        learning_rate=cum_metrics.learning_rate / log_interval,
-                        grad_norm=cum_metrics.grad_norm / log_interval,
-                        raw_grad_norm=cum_metrics.raw_grad_norm / log_interval,
-                        total_loss=cum_metrics.total_loss / log_interval,
-                    )
-                    cum_stats = cum_stats.average()
-                else:
-                    cum_metrics = metrics
-                    cum_stats = stats_dict
-                training_io.log(step, logger, cum_metrics, cum_stats)
-                cum_metrics = metrics
-                cum_stats = CumulativeStatsDict.create()
-                cum_stats.update(stats_dict)
-            else:
-                update_metrics(metrics, stats_dict)
-
-        end_time = time.time()
-        print(f"Total time: {end_time - start_time:.2f} seconds")
-        training_io.save_checkpoint(model_dir, config.training.steps, state, config.io)
+        # Final evaluation
         print("Evaluating final model...")
-        loader = get_loader("validation", config.training_data, config.training.tokens)
+        evaluate_model(config, state, model_dir, logger, "final")
 
-        total_loss = 0.0
-        num_batches = config.training.steps // 10
 
-        for step in range(num_batches):
-            batch = loader.load(step)
-            _, loss, stats_dict = eval_model(
-                state, jnp.uint32(step), config.model, batch
+def train_phase(config, state, start_step, loader, model_dir, logger):
+    """Training phase that can handle both regular and post-training."""
+    phase_name = "post-training" if config.training.is_post_training else "training"
+    print(f"Compiling {phase_name} step...")
+
+    c_training_step = training_step.lower(
+        state, jnp.uint32(0), config.model, config.training, loader.load(0)
+    ).compile()
+
+    n_log_iterations = config.training.n_log_iterations or 5000
+    log_interval = math.ceil(config.training.steps / n_log_iterations)
+    print(f"{phase_name.title()} phase log interval: {log_interval}")
+
+    cum_metrics = None
+    cum_stats = None
+
+    def update_metrics(metrics: Metrics, stats_dict: StatsDict):
+        nonlocal cum_metrics, cum_stats
+        if cum_metrics is None:
+            cum_metrics = metrics
+            cum_stats = CumulativeStatsDict.create()
+        else:
+            cum_metrics.loss += metrics.loss
+            cum_metrics.grad_norm += metrics.grad_norm
+            cum_metrics.raw_grad_norm += metrics.raw_grad_norm
+            cum_metrics.learning_rate += metrics.learning_rate
+            cum_metrics.total_loss += metrics.total_loss
+        cum_stats.update(stats_dict)
+
+    start_time = time.time()
+
+    for step in range(start_step, config.training.steps):
+        if step % config.checkpoint_interval == 0 and step > start_step:
+            training_io.save_checkpoint(model_dir, step, state, config.io)
+
+        # We profile on the second step, because the first step has a long pause for XLA
+        # compilation and initial shuffle buffer loading.
+        if training_io.is_device_0() and step == start_step + 1:
+            jax.block_until_ready(state)
+            training_io.start_profile()
+            profile_start = time.time()
+
+        state, output = c_training_step(state, jnp.uint32(step), loader.load(step))
+
+        # Run profile for two steps, to include data loading time in between them.
+        if training_io.is_device_0() and step == start_step + 2:
+            jax.block_until_ready(state)
+            profile_duration = time.time() - profile_start
+            training_io.stop_profile(model_dir)
+
+            # Print MFU, including (one step of) data loading time.
+            print(f"Profile time: {profile_duration}s for 2 steps.")
+            model_params = jax.tree.reduce(
+                operator.add, jax.tree.map(lambda w: w.size, state.weights)
             )
-            total_loss += loss
+            tokens = batch.targets.size
+            print(f"Model params: {model_params:_}")
+            print(f"Tokens: {tokens:_}")
+            device_flops = training_io.get_flops_per_device()
+            num_devices = jax.device_count()
+            print(
+                f"MFU (projections only): {100 * (2 * 6 * model_params * tokens / (num_devices * profile_duration)) / device_flops:.2f}% MFU"
+            )
 
-        avg_loss = total_loss / num_batches
-        perplexity = jnp.exp(avg_loss)
-        if training_io.is_device_0():
-            print(f"\nEvaluation Results:")
-            print(f"Average Loss: {avg_loss:.4f}")
-            print(f"Perplexity: {perplexity:.4f}")
+        batch = loader.load(step)
+        state, (metrics, stats_dict) = c_training_step(state, jnp.uint32(step), batch)
 
-            if logger:
-                logger.report_scalar(
-                    series="eval",
-                    title="final_loss",
-                    value=avg_loss,
-                    iteration=config.training.steps,
+        if step % log_interval == 0:
+            if cum_metrics:
+                cum_metrics = Metrics(
+                    loss=cum_metrics.loss / log_interval,
+                    learning_rate=cum_metrics.learning_rate / log_interval,
+                    grad_norm=cum_metrics.grad_norm / log_interval,
+                    raw_grad_norm=cum_metrics.raw_grad_norm / log_interval,
+                    total_loss=cum_metrics.total_loss / log_interval,
                 )
-                logger.report_scalar(
-                    series="eval",
-                    title="final_perplexity",
-                    value=perplexity,
-                    iteration=config.training.steps,
-                )
+                cum_stats = cum_stats.average()
+            else:
+                cum_metrics = metrics
+                cum_stats = stats_dict
+            # Add prefix for post-training phase
+            prefix = "post_train_" if config.training.is_post_training else ""
+            training_io.log(step, logger, cum_metrics, cum_stats, prefix=prefix)
+            cum_metrics = metrics
+            cum_stats = CumulativeStatsDict.create()
+            cum_stats.update(stats_dict)
+        else:
+            update_metrics(metrics, stats_dict)
+
+    end_time = time.time()
+    print(f"{phase_name.title()} phase time: {end_time - start_time:.2f} seconds")
+    training_io.save_checkpoint(model_dir, config.training.steps, state, config.io)
+    return state
+
+
+def evaluate_model(config, state, model_dir, logger, phase):
+    """Evaluate the model on the validation set."""
+    loader = get_loader("validation", config.training_data, config.training.tokens)
+
+    total_loss = 0.0
+    num_batches = config.training.steps // 10
+
+    for step in range(num_batches):
+        batch = loader.load(step)
+        _, loss, stats_dict = eval_model(state, jnp.uint32(step), config.model, batch)
+        total_loss += loss
+
+    avg_loss = total_loss / num_batches
+    perplexity = jnp.exp(avg_loss)
+    if training_io.is_device_0():
+        print(f"\nEvaluation Results:")
+        print(f"Average Loss: {avg_loss:.4f}")
+        print(f"Perplexity: {perplexity:.4f}")
+
+        if logger:
+            logger.report_scalar(
+                series="eval",
+                title="final_loss",
+                value=avg_loss,
+                iteration=config.training.steps,
+            )
+            logger.report_scalar(
+                series="eval",
+                title="final_perplexity",
+                value=perplexity,
+                iteration=config.training.steps,
+            )
 
 
 def clear_tpu_locks():

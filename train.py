@@ -612,7 +612,7 @@ class Model:
             )
             softmask_probs = jnp.bfloat16(quiet_softmax(softmask_logits))
             cluster_recall = einops.reduce(
-                softmask,
+                jax.lax.stop_gradient(raw_probs) * softmask,
                 "B Qlen Klen Q K -> B Qlen Q K",
                 "sum",
             )  # how much of the total probability we recall after masking
@@ -622,15 +622,9 @@ class Model:
             softmask_keys_retrieved = einops.reduce(
                 softmask * causal_mask, "B Qlen Klen Q K -> B Qlen Q K", "sum"
             )  # approximating the number of keys retrieved
-            cluster_recall_per_key = jnp.where(
-                jnp.float32(softmask_keys_retrieved) > 0,
-                cluster_recall / softmask_keys_retrieved,
-                0.0,
-            )  # TODO: Do we need this metric
             stats["cluster_recall"] = get_stats(cluster_recall)
             stats["relative_cluster_recall"] = get_stats(relative_cluster_recall)
             stats["log_cluster_recall"] = get_stats(jnp.log(cluster_recall + 1e-6))
-            stats["cluster_recall_per_key"] = get_stats(cluster_recall_per_key)
             probs = jax.lax.select(
                 apply_softmask, jnp.bfloat16(softmask_probs), raw_probs
             )
@@ -658,7 +652,9 @@ class Model:
                 hardmask_probs, "B Qlen Klen Q K -> B Qlen Q K", "sum"
             )
             stats["hard_cluster_recall"] = get_stats(hard_cluster_recall)
-            retrieved_percent = jnp.sum(hardmask, axis=2) / jnp.sum(causal_mask, axis=2)
+            retrieved_percent = jnp.sum(hardmask * causal_mask, axis=2) / jnp.sum(
+                causal_mask, axis=2
+            )
             stats["retrieved_percent"] = get_stats(retrieved_percent)
             # maybe we want a loss based on prob per token loaded, total_prob/total_tokens_loaded, if below threshold drop it
             # to raise precision?
@@ -786,7 +782,8 @@ class Model:
         tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
         ce_loss = -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
         recall_loss = jnp.where(
-            stats_dict["retrieved_percent"].mean > h.retrieve_budget,
+            stats_dict["soft_retrieved_percent"].mean
+            > h.retrieve_budget,  # TODO: change this to be per layer instead of cross layers?
             -stats_dict["log_cluster_recall"].mean
             + stats_dict[
                 "log_soft_retrieved_percent"
@@ -798,6 +795,19 @@ class Model:
             total_loss,
             (ce_loss, stats_dict),
         )
+
+
+# half heads do rope, half do nope
+# sparsified - rope work with local SW, nope choses what it needs
+
+# increase learning rate
+# increase keys LR more than the rest
+
+# simples way total # of keys retrieved within some budget
+# do cross entropy whole way through, remove recall
+# CE + budget
+# recall + budget
+# recall + budget + CE
 
 
 @pytree_dataclass
@@ -1234,34 +1244,10 @@ def main_contained(config, logger):
             model_dir, state, config.io
         )
 
-        # Explicitly compile training step, to record XLA HLO graph.
-        # See https://bnikolic.co.uk/blog/python/jax/2022/02/22/jax-outputgraph-rev
-        c_training_step = training_step.lower(
-            state, jnp.uint32(0), config.model, config.training, loader.load(0)
-        ).compile()
-        date = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
         # training_io.save_hlo_svg(os.path.join(model_dir, f'training_step_optimized_hlo_{date}.svg'), c_training_step)
         n_log_iterations = config.training.n_log_iterations or 5000
         log_interval = math.ceil(config.training.steps / n_log_iterations)
         print(f"{log_interval=}")
-
-        cum_metrics = None
-        cum_stats = None
-
-        def update_metrics(metrics: Metrics, stats_dict: StatsDict):
-            nonlocal cum_metrics, cum_stats
-            if cum_metrics is None:
-                cum_metrics = metrics
-                cum_stats = CumulativeStatsDict.create()
-            else:
-                cum_metrics.loss += metrics.loss
-                cum_metrics.grad_norm += metrics.grad_norm
-                cum_metrics.raw_grad_norm += metrics.raw_grad_norm
-                cum_metrics.learning_rate += metrics.learning_rate
-                cum_metrics.total_loss += metrics.total_loss
-            cum_stats.update(stats_dict)
-
-        start_time = time.time()
 
         # Regular training phase
         print("Starting main training phase...")
@@ -1275,15 +1261,17 @@ def main_contained(config, logger):
         print("Starting post-training phase for partitioning parameters...")
         post_train_config = replace(
             config.training,
-            steps=config.training.steps
-            // 10,  # Shorter training phase for post-training
-            warmup_steps=config.training.warmup_steps // 10,
-            learning_rate=config.training.learning_rate
-            * 0.1,  # Lower learning rate for fine-tuning
             is_post_training=True,  # Set the flag for post-training
+            seed=config.training.seed
+            + 1000000,  # Use a different seed for post-training data
         )
         post_train_config = replace(config, training=post_train_config)
-        state = train_phase(post_train_config, state, 0, loader, model_dir, logger)
+        post_train_loader = get_loader(
+            "train", config.training_data, post_train_config.training.tokens
+        )
+        state = train_phase(
+            post_train_config, state, 0, post_train_loader, model_dir, logger
+        )
 
         # Final evaluation
         print("Evaluating final model...")
@@ -1334,7 +1322,8 @@ def train_phase(config, state, start_step, loader, model_dir, logger):
             training_io.start_profile()
             profile_start = time.time()
 
-        state, output = c_training_step(state, jnp.uint32(step), loader.load(step))
+        batch = loader.load(step)
+        state, (metrics, stats_dict) = c_training_step(state, jnp.uint32(step), batch)
 
         # Run profile for two steps, to include data loading time in between them.
         if training_io.is_device_0() and step == start_step + 2:
@@ -1355,9 +1344,6 @@ def train_phase(config, state, start_step, loader, model_dir, logger):
             print(
                 f"MFU (projections only): {100 * (2 * 6 * model_params * tokens / (num_devices * profile_duration)) / device_flops:.2f}% MFU"
             )
-
-        batch = loader.load(step)
-        state, (metrics, stats_dict) = c_training_step(state, jnp.uint32(step), batch)
 
         if step % log_interval == 0:
             if cum_metrics:
@@ -1384,7 +1370,8 @@ def train_phase(config, state, start_step, loader, model_dir, logger):
         f"{phase_name if phase_name else 'training'} phase time: {end_time - start_time:.2f} seconds"
     )
 
-    training_io.save_checkpoint(model_dir, config.training.steps, state, config.io)
+    if config.training.steps != start_step:
+        training_io.save_checkpoint(model_dir, config.training.steps, state, config.io)
     return state
 
 

@@ -236,6 +236,7 @@ def load_zarr(filename: str, state: PyTree, config: IOConfig) -> PyTree:
     """Loads a zarr checkpoint from disk.
 
     See docs/pytree-zarr-checkpoint.md for the checkpoint format.
+    If a key exists in the state but not in the checkpoint, the original state value is kept.
     """
     root = zarr.open_group(filename, mode="r")
     if "write_completed" not in root.attrs:
@@ -247,6 +248,12 @@ def load_zarr(filename: str, state: PyTree, config: IOConfig) -> PyTree:
         path = jax.tree_util.keystr(path)
         shape = prev.shape
         sharding = prev.sharding
+        if path not in root:
+            print(
+                f"Warning: Key '{path}' not found in checkpoint, keeping original state."
+            )
+            return prev
+
         arr = root[path]
         assert (
             arr.shape == shape

@@ -781,16 +781,18 @@ class Model:
         )
         tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
         ce_loss = -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
-        recall_loss = jnp.where(
-            stats_dict["soft_retrieved_percent"].mean
-            > h.retrieve_budget,  # TODO: change this to be per layer instead of cross layers?
-            -stats_dict["log_cluster_recall"].mean
-            + stats_dict[
-                "log_soft_retrieved_percent"
-            ].mean,  # this is causing a significant change in the loss
-            -stats_dict["log_cluster_recall"].mean,
-        )
-        total_loss = ce_loss + recall_loss
+        retrieve_loss = 0.0
+        for layer in range(1, h.layers):  # skip first layer based on patterns
+            soft_retrieved = stats_dict[f"{layer}.soft_retrieved_percent"].mean
+            log_soft_retrieved = stats_dict[f"{layer}.log_soft_retrieved_percent"].mean
+            retrieve_loss += jnp.where(
+                soft_retrieved > h.retrieve_budget,
+                log_soft_retrieved,
+                0.0,
+            )
+
+        retrieve_loss = retrieve_loss / (h.layers - 1)
+        total_loss = ce_loss + retrieve_loss
         return (
             total_loss,
             (ce_loss, stats_dict),
@@ -1251,7 +1253,9 @@ def main_contained(config, logger):
 
         # Regular training phase
         print("Starting main training phase...")
-        state = train_phase(config, state, start_step, loader, model_dir, logger)
+        state = train_phase(
+            config, state, start_step, loader, model_dir, logger, log_interval
+        )
 
         # Evaluate after main training
         print("Evaluating model after main training phase...")
@@ -1262,15 +1266,23 @@ def main_contained(config, logger):
         post_train_config = replace(
             config.training,
             is_post_training=True,  # Set the flag for post-training
-            seed=config.training.seed
-            + 1000000,  # Use a different seed for post-training data
+            learning_rate=config.training.learning_rate,
+            warmup_steps=config.training.warmup_steps // 30,
+            steps=config.training.steps // 3,
+            seed=config.training.seed + 10,
         )
         post_train_config = replace(config, training=post_train_config)
         post_train_loader = get_loader(
             "train", config.training_data, post_train_config.training.tokens
         )
         state = train_phase(
-            post_train_config, state, 0, post_train_loader, model_dir, logger
+            post_train_config,
+            state,
+            0,
+            post_train_loader,
+            model_dir,
+            logger,
+            log_interval,
         )
 
         # Final evaluation
@@ -1278,7 +1290,7 @@ def main_contained(config, logger):
         evaluate_model(config, state, model_dir, logger, "final")
 
 
-def train_phase(config, state, start_step, loader, model_dir, logger):
+def train_phase(config, state, start_step, loader, model_dir, logger, log_interval):
     """Training phase that can handle both regular and post-training."""
     phase_name = "post_train" if config.training.is_post_training else ""
     model_dir = f"{model_dir}_{phase_name}" if phase_name else model_dir
@@ -1287,8 +1299,6 @@ def train_phase(config, state, start_step, loader, model_dir, logger):
         state, jnp.uint32(0), config.model, config.training, loader.load(0)
     ).compile()
 
-    n_log_iterations = config.training.n_log_iterations or 5000
-    log_interval = math.ceil(config.training.steps / n_log_iterations)
     print(
         f"{phase_name if phase_name else 'training'} phase log interval: {log_interval}"
     )

@@ -101,7 +101,7 @@ class Hparams:
     softmask_start_fraction: float = 1.0
     hardmask_start_fraction: float = 1.0
     hard_q_threshold: float = 0.5
-    retrieve_budget: float = 0.5
+    retrieval_scale: float = 1.0  # how much we scale the thre retrieval penalty
 
 
 @pytree_dataclass
@@ -431,7 +431,7 @@ class Model:
             dtype=jnp.float32,
         )
 
-        q_bias = jnp.ones(w_q_gate_shape[:-1], dtype=jnp.float32)
+        q_bias = jnp.ones(w_q_gate_shape[:-1], dtype=jnp.float32) * 100.0
         arrays = Model(
             embed=embed,
             unembed=unembed,
@@ -560,6 +560,7 @@ class Model:
             stats["logits"] = get_stats(logits)
             raw_logits = jnp.where(causal_mask, logits, -1e10)
             raw_probs = jnp.bfloat16(quiet_softmax(raw_logits))
+            stats["raw_probs"] = get_stats(raw_probs)
             total_raw_probs = jax.lax.stop_gradient(
                 einops.reduce(raw_probs, "B Qlen Klen Q K -> B Qlen Q K", "sum")
             )
@@ -583,6 +584,8 @@ class Model:
                 jax.lax.stop_gradient(gx),
                 w_k_routing,
             )
+            stats["q_gate"] = get_stats(q_gate)
+            stats["k_route"] = get_stats(k_route)
             # TODO: add biases to q
             # temp = 0.01 + 20 * (jnp.float32(step) / jnp.float32(total_steps))
             # sigmoid (q_gate + bias) # want them to select all the keys => pretty close to 1 at first
@@ -592,8 +595,13 @@ class Model:
             q_bias = einops.rearrange(
                 layer_weights.q_bias, "n_partitions Q K -> Q K n_partitions"
             )
+            q_gate = q_gate + q_bias
+            stats["q_bias"] = get_stats(q_bias)
+            stats["q_gate_bias"] = get_stats(q_gate)
             q_gate = jax.nn.sigmoid(q_gate)
+            stats["q_gate_sigmoid"] = get_stats(q_gate)
             k_route = jax.nn.softmax(k_route, axis=-1)
+            stats["k_route_softmax"] = get_stats(k_route)
             softmask = shardops.einsum_unreduced(
                 "B/d Qlen Q K/t n_partitions, B/d Klen K/t n_partitions -> B/d Qlen Klen Q K/t",
                 q_gate,
@@ -611,6 +619,7 @@ class Model:
                 (causal_mask * softmask) != 0, softmask_logits, -1e10
             )
             softmask_probs = jnp.bfloat16(quiet_softmax(softmask_logits))
+            stats["softmask_probs"] = get_stats(softmask_probs)
             cluster_recall = einops.reduce(
                 jax.lax.stop_gradient(raw_probs) * softmask,
                 "B Qlen Klen Q K -> B Qlen Q K",
@@ -781,18 +790,14 @@ class Model:
         )
         tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
         ce_loss = -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
+        recall_loss = -stats_dict["log_cluster_recall"].mean
         retrieve_loss = 0.0
         for layer in range(1, h.layers):  # skip first layer based on patterns
-            soft_retrieved = stats_dict[f"{layer}.soft_retrieved_percent"].mean
             log_soft_retrieved = stats_dict[f"{layer}.log_soft_retrieved_percent"].mean
-            retrieve_loss += jnp.where(
-                soft_retrieved > h.retrieve_budget,
-                log_soft_retrieved,
-                0.0,
-            )
+            retrieve_loss += log_soft_retrieved
 
         retrieve_loss = retrieve_loss / (h.layers - 1)
-        total_loss = ce_loss + retrieve_loss
+        total_loss = ce_loss + h.retrieval_scale * retrieve_loss + recall_loss
         return (
             total_loss,
             (ce_loss, stats_dict),
@@ -930,6 +935,7 @@ class TrainingHparams:
     use_single_worker: Optional[bool] = False
     use_multistage_training: Optional[bool] = False
     is_post_training: Optional[bool] = False  # Flag to indicate post-training phase
+    post_training_mult: float = 1.0
 
 
 @pytree_dataclass
@@ -1266,7 +1272,8 @@ def main_contained(config, logger):
         post_train_config = replace(
             config.training,
             is_post_training=True,  # Set the flag for post-training
-            learning_rate=config.training.learning_rate,
+            learning_rate=config.training.learning_rate
+            * config.training.post_training_mult,
             warmup_steps=config.training.warmup_steps // 30,
             steps=config.training.steps // 3,
             seed=config.training.seed + 10,

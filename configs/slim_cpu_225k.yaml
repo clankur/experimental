@@ -6,8 +6,8 @@ defaults:
 num_hosts: 1
 
 mesh:
-  d: 8 
-  t: 1
+  d: 4 
+  t: 2
 
 training:
   warmup_steps: 10
@@ -25,21 +25,24 @@ model:
   n_q_per_kv: 1 
   n_kv: 1 
   d_head: 32 
-  layers: 1
   d_ff: 512 
+  layers: 1
   vocab: 32768
- 
-  rope_max_timescale: 10000
-  a_attn: 1.
-  a_output: 1.
-  zero_queries: true
-  zero_unembed: true
+
   base:
-    d_model: 128
+    d_model: 64
     n_q_per_kv: 1
     n_kv: 1 
     d_head: 32 
     d_ff: 512 
+ 
+  rope_max_timescale: 10000
+
+  a_attn: 1.
+  a_output: 1.
+  zero_queries: true
+  zero_unembed: true
+
   parameterization: "sp" 
   fully_aligned: false
   gamma_embed: 1. 

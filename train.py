@@ -564,6 +564,7 @@ class Model:
             total_raw_probs = jax.lax.stop_gradient(
                 einops.reduce(raw_probs, "B Qlen Klen Q K -> B Qlen Q K", "sum")
             )
+            stats["total_raw_probs"] = get_stats(total_raw_probs)
             # Partition routing
             w_q_gate = shardops.all_gather(
                 "n_partitions Q K/t M/d -> n_partitions Q K/t M",
@@ -633,7 +634,6 @@ class Model:
             )  # approximating the number of keys retrieved
             stats["cluster_recall"] = get_stats(cluster_recall)
             stats["relative_cluster_recall"] = get_stats(relative_cluster_recall)
-            stats["log_cluster_recall"] = get_stats(jnp.log(cluster_recall + 1e-6))
             probs = jax.lax.select(
                 apply_softmask, jnp.bfloat16(softmask_probs), raw_probs
             )
@@ -790,7 +790,9 @@ class Model:
         )
         tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
         ce_loss = -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
-        recall_loss = -stats_dict["log_cluster_recall"].mean
+        recall_loss = -jnp.log(
+            stats_dict["cluster_recall"].mean / stats_dict["total_raw_probs"].mean
+        )
         retrieve_loss = 0.0
         for layer in range(1, h.layers):  # skip first layer based on patterns
             log_soft_retrieved = stats_dict[f"{layer}.log_soft_retrieved_percent"].mean

@@ -218,15 +218,6 @@ def get_parameterization(style: str, fully_aligned: bool = True):
 
 
 @pytree_dataclass
-class SyntheticMetrics:
-    avg_confidence: f32[b""]
-    avg_char_confidence: f32[b""]
-    max_char_confidence: f32[b""]
-    avg_start_char_confidence: f32[b""]
-    avg_final_char_confidence: f32[b""]
-
-
-@pytree_dataclass
 class TransformerLayer:
     ln1: f32["d_model/t/d"]
     ln2: f32["d_model/t/d"]
@@ -683,9 +674,11 @@ class TrainingHparams:
     tokens: TokenBatchParams
     seed: int
     queue: Optional[str] = None
+    n_log_iterations: Optional[int] = 5000
     use_grad_clip: Optional[bool] = True
     use_gpu: Optional[bool] = False
-    use_single_pod: Optional[bool] = False
+    use_single_worker: Optional[bool] = False
+    use_multistage_training: Optional[bool] = False
 
 
 @pytree_dataclass
@@ -700,6 +693,20 @@ class State:
         adam_mu = jax.tree.map(lambda p: p * 0.0, weights)
         adam_nu = jax.tree.map(lambda p: p * 0.0, weights)
         return State(weights=weights, adam_mu=adam_mu, adam_nu=adam_nu)
+
+
+@partial(jax.jit, static_argnums=(1))
+@shardtypes.scope
+def eval_model(state: State, h: Hparams, batch: TokenBatch) -> f32[b""]:
+    @partial(shardtypes.typed_shard_map, check_rep=False)
+    def eval_model_shard(state: State, batch: TokenBatch) -> f32[b""]:
+        loss, _ = jax.value_and_grad(lambda weights: weights.loss(h, batch))(
+            state.weights
+        )
+        loss = jax.lax.psum(loss, ("d", "t"))
+        return loss
+
+    return eval_model_shard(state, batch)
 
 
 @partial(jax.jit, static_argnums=(2, 3), donate_argnums=(0,))
@@ -896,7 +903,7 @@ def main_contained(config, logger):
     # TODO: check this is true and if not, provide our own that actually is fusable.
 
     # 4x 1 chip (2 cores) per process:
-    if config.training.use_single_pod:
+    if config.training.use_single_worker:
         os.environ["TPU_CHIPS_PER_HOST_BOUNDS"] = "1,1,1"
         os.environ["TPU_HOST_BOUNDS"] = "1,1,1"
     jax.config.update("jax_threefry_partitionable", True)
@@ -934,8 +941,8 @@ def main_contained(config, logger):
         ).compile()
         date = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
         # training_io.save_hlo_svg(os.path.join(model_dir, f'training_step_optimized_hlo_{date}.svg'), c_training_step)
-
-        log_interval = math.ceil(config.training.steps / 5000)
+        n_log_iterations = config.training.n_log_iterations or 5000
+        log_interval = math.ceil(config.training.steps / n_log_iterations)
         print(f"{log_interval=}")
 
         cum_metrics = None
@@ -962,8 +969,11 @@ def main_contained(config, logger):
 
             state, output = c_training_step(state, jnp.uint32(step), loader.load(step))
 
-            # if half way point, double seq length and halve batch size
-            if step == config.training.steps // 2:
+            # if half way point and multistage training is enabled, double seq length and halve batch size
+            if (
+                step == config.training.steps // 2
+                and config.training.use_multistage_training
+            ):
                 print("updating seq length and batch size")
                 tokens = replace(
                     config.training.tokens,
@@ -998,7 +1008,7 @@ def main_contained(config, logger):
                 model_params = jax.tree.reduce(
                     operator.add, jax.tree.map(lambda w: w.size, state.weights)
                 )
-                tokens = loader.load(step).targets.size
+                tokens = batch.targets.size
                 print(f"Model params: {model_params:_}")
                 print(f"Tokens: {tokens:_}")
                 device_flops = training_io.get_flops_per_device()
@@ -1024,6 +1034,38 @@ def main_contained(config, logger):
 
         end_time = time.time()
         print(f"Total time: {end_time - start_time:.2f} seconds")
+        training_io.save_checkpoint(model_dir, config.training.steps, state, config.io)
+        print("Evaluating final model...")
+        loader = get_loader("validation", config.training_data, config.training.tokens)
+
+        total_loss = 0.0
+        num_batches = config.training.steps // 10
+
+        for step in range(num_batches):
+            batch = loader.load(step)
+            loss = eval_model(state, config.model, batch)
+            total_loss += loss
+
+        avg_loss = total_loss / num_batches
+        perplexity = jnp.exp(avg_loss)
+        if training_io.is_device_0():
+            print(f"\nEvaluation Results:")
+            print(f"Average Loss: {avg_loss:.4f}")
+            print(f"Perplexity: {perplexity:.4f}")
+
+            if logger:
+                logger.report_scalar(
+                    series="eval",
+                    title="final_loss",
+                    value=avg_loss,
+                    iteration=config.training.steps,
+                )
+                logger.report_scalar(
+                    series="eval",
+                    title="final_perplexity",
+                    value=perplexity,
+                    iteration=config.training.steps,
+                )
 
 
 def clear_tpu_locks():
@@ -1045,17 +1087,19 @@ def clear_tpu_locks():
         pass
 
 
-def get_model_name(config_name: str):
+def get_filtered_overrides():
+    """Get filtered override strings from Hydra config, excluding certain overrides."""
     overrides = hydra.core.hydra_config.HydraConfig.get()["job"]["override_dirname"]
-    ignore_overrides = [
-        "training.queue",
-    ]
-    overrides = [
-        override.lstrip("+")
+    ignore_overrides = ["training.queue", "flat_tokens.filespec"]
+    return [
+        f"{override.lstrip('+').split('=')[0].split('.')[-1]}={override.split('=')[1]}"
         for override in overrides.split(",")
-        if override.lstrip("+").split("=")[0] not in ignore_overrides
+        if override and override.lstrip("+").split("=")[0] not in ignore_overrides
     ]
 
+
+def get_model_name(config_name: str):
+    overrides = get_filtered_overrides()
     overrides = "_".join(overrides)
     return f"{config_name}_{overrides}" if overrides else config_name
 
@@ -1081,6 +1125,10 @@ def main(config):
             project_name=f"{config_name}/{git_branch_name}", task_name=task_name
         )
 
+        # Add git branch and filtered overrides as tags
+        override_tags = get_filtered_overrides()
+        task.add_tags([git_branch_name] + override_tags)
+
         if config.training.use_gpu:
             task.set_packages("requirements-gpu.txt")
         else:
@@ -1093,7 +1141,6 @@ def main(config):
         print("Datasets CLI Environment:")
         print(result.stdout)
 
-        task.add_tags([git_branch_name])
         logger = task.get_logger()
         task.execute_remotely(queue_name=config.training.queue)
         task.launch_multi_node(

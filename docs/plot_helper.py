@@ -2,6 +2,24 @@ from clearml import Task
 import matplotlib.pyplot as plt
 
 
+def get_experiment_ids_from_url(url: str) -> list[str]:
+    """Extract experiment IDs from a ClearML compare-experiments URL.
+
+    Args:
+        url (str): ClearML URL containing experiment IDs
+
+    Returns:
+        list[str]: List of experiment IDs
+    """
+    # Find the ids= parameter and extract everything after it until the next / or end of string
+    if "ids=" not in url:
+        raise ValueError("URL does not contain experiment IDs in the expected format")
+
+    ids_section = url.split("ids=")[1].split("/")[0]
+    experiment_ids = ids_section.split(",")
+    return experiment_ids
+
+
 def get_loss_data(task_ids):
     loss_data = {}
     for task_id in task_ids:
@@ -11,8 +29,7 @@ def get_loss_data(task_ids):
         x_values = scalar_logs["loss"]["loss"]["x"]
         y_values = scalar_logs["loss"]["loss"]["y"]
 
-        task_name = task.name
-
+        task_name = task.name.replace("model.", "")
         loss_data[task_id] = {"name": task_name, "steps": x_values, "loss": y_values}
     return loss_data
 
@@ -39,7 +56,14 @@ def plot_loss_data(loss_data, plot_last: int = 1000):
     plt.title("Loss Over Steps for Each Task")
     plt.xlabel("Steps")
     plt.ylabel("Loss")
-    plt.legend(title="Experiments")
+    plt.legend(
+        title="Experiments",
+        bbox_to_anchor=(0.5, -0.1),
+        loc="upper center",
+        fontsize="small",
+        title_fontsize="small",
+        ncol=2,
+    )
     plt.minorticks_on()
     plt.grid(which="both", linestyle="--", linewidth=0.5)
     plt.show()

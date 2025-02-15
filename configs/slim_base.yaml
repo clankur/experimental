@@ -23,13 +23,14 @@ training:
   use_gpu: false
 
 hf_dataset:
-  path: DKYoon/SlimPajama-6B
+  path: cerebras/SlimPajama-627B
   name: default
-  num_workers: 1
+  num_workers:  32
   tokenizer: mistralai/Mistral-7B-v0.1 # may require huggingface-cli login
   sequences_packed_per_batch: 120
   seed: 0
   max_retries: 5
+  select_column: "text"
 
 paths:
   # root_working_dir can also be a path on a local filesystem

@@ -561,8 +561,8 @@ class Model:
             raw_logits = jnp.where(causal_mask, logits, -1e10)
             raw_probs = jnp.bfloat16(quiet_softmax(raw_logits))
             stats["raw_probs"] = get_stats(raw_probs)
-            total_raw_probs = jax.lax.stop_gradient(
-                einops.reduce(raw_probs, "B Qlen Klen Q K -> B Qlen Q K", "sum")
+            total_raw_probs = einops.reduce(
+                raw_probs, "B Qlen Klen Q K -> B Qlen Q K", "sum"
             )
             stats["total_raw_probs"] = get_stats(total_raw_probs)
             # Partition routing
@@ -576,13 +576,13 @@ class Model:
             # query gate identifies a partition of the keys it wants
             q_gate = shardops.einsum_unreduced(
                 "B/d L M, n_partitions Q K/t M -> B/d L Q K/t n_partitions",
-                jax.lax.stop_gradient(gx),
+                (gx),
                 w_q_gate,
             )
             # key routing routes the each key to aspecific partition
             k_route = shardops.einsum_unreduced(
                 "B/d L M, n_partitions K/t M -> B/d L K/t n_partitions",
-                jax.lax.stop_gradient(gx),
+                (gx),
                 w_k_routing,
             )
             stats["q_gate"] = get_stats(q_gate)
@@ -613,7 +613,7 @@ class Model:
             # apply softmask
             apply_softmask = step >= h.softmask_start_fraction * total_steps
             apply_hardmask = step >= h.hardmask_start_fraction * total_steps
-            softmask_logits = jax.lax.stop_gradient(logits) + jnp.log(
+            softmask_logits = (logits) + jnp.log(
                 softmask + 1e-6
             )  # TODO: review this line
             softmask_logits = jnp.where(
@@ -622,7 +622,7 @@ class Model:
             softmask_probs = jnp.bfloat16(quiet_softmax(softmask_logits))
             stats["softmask_probs"] = get_stats(softmask_probs)
             cluster_recall = einops.reduce(
-                jax.lax.stop_gradient(raw_probs) * softmask,
+                (raw_probs) * softmask,
                 "B Qlen Klen Q K -> B Qlen Q K",
                 "sum",
             )  # how much of the total probability we recall after masking
@@ -788,7 +788,7 @@ class Model:
         logprobs_at_targets = shardops.psum_scatter(
             "batch/d len -> batch/d len/t", logprobs_at_targets
         )
-        tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
+        tokens_in_global_batch = logprobs_at_targets.size * lax.psum(1, ("d", "t"))
         ce_loss = -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
         recall_loss = -jnp.log(
             stats_dict["cluster_recall"].mean / stats_dict["total_raw_probs"].mean
@@ -1020,33 +1020,6 @@ def training_step(
         # So we reduce the loss across chips _outside_ the autodiff.
 
         # If in post-training phase, zero out gradients for non-partitioning parameters
-        if hparams.is_post_training:
-            # Create a new transformer with zeroed gradients
-            zeroed_transformer = Transformer(
-                ln1=jnp.zeros_like(grad.transformer.ln1),
-                ln2=jnp.zeros_like(grad.transformer.ln2),
-                w_q=jnp.zeros_like(grad.transformer.w_q),
-                w_kv=jnp.zeros_like(grad.transformer.w_kv),
-                w_o=jnp.zeros_like(grad.transformer.w_o),
-                w_gate=jnp.zeros_like(grad.transformer.w_gate),
-                w_up=jnp.zeros_like(grad.transformer.w_up),
-                w_down=jnp.zeros_like(grad.transformer.w_down),
-                # Keep the partitioning parameters' gradients
-                w_q_gate=grad.transformer.w_q_gate,
-                w_k_routing=grad.transformer.w_k_routing,
-                q_bias=grad.transformer.q_bias,
-            )
-
-            # Replace the transformer gradients
-            grad = replace(grad, transformer=zeroed_transformer)
-
-            # Zero out embedding and unembedding gradients
-            grad = replace(
-                grad,
-                embed=jnp.zeros_like(grad.embed),
-                unembed=jnp.zeros_like(grad.unembed),
-                final_layer_norm=jnp.zeros_like(grad.final_layer_norm),
-            )
 
         loss = jax.lax.psum(loss, ("d", "t"))
         ce_loss = jax.lax.psum(ce_loss, ("d", "t"))
@@ -1126,14 +1099,21 @@ def training_step(
         new_ps = []
         new_mus = []
         new_nus = []
-        for p, g, mu, nu, spec, lr_scale in zip(
-            tree_leaves(state.weights),
+        paths_and_values, _ = jax.tree_util.tree_flatten_with_path(state.weights)
+        parameter_names, parameters = zip(
+            *[(jax.tree_util.keystr(path), value) for path, value in paths_and_values]
+        )
+
+        for p_name, p, g, mu, nu, spec, lr_scale in zip(
+            parameter_names,
+            parameters,
             grad_leaves,
             tree_leaves(state.adam_mu),
             tree_leaves(state.adam_nu),
             tree_leaves(shardtypes.make_partition_specs(State)),
             tree_leaves(lr_scales),
         ):
+            print(p_name, p.shape, g.shape)
             # Gradient clipping
             g = g * rescale
             # Adam scaling
@@ -1154,7 +1134,17 @@ def training_step(
             g *= lr * lr_scale
 
             # Apply update
-            new_ps.append(p - g)
+            if hparams.is_post_training:
+                if p_name in [
+                    "transformer.w_q_gate",
+                    "transformer.w_k_routing",
+                    "transformer.q_bias",
+                ]:
+                    new_ps.append(p - g)
+                else:  # other weights are frozen
+                    new_ps.append(p)
+            else:
+                new_ps.append(p - g)
             new_mus.append(mu)
             new_nus.append(nu)
 

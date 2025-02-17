@@ -431,7 +431,7 @@ class Model:
             dtype=jnp.float32,
         )
 
-        q_bias = jnp.ones(w_q_gate_shape[:-1], dtype=jnp.float32) * 100.0
+        q_bias = jnp.ones(w_q_gate_shape[:-1], dtype=jnp.float32) * 20.0
         arrays = Model(
             embed=embed,
             unembed=unembed,
@@ -1136,9 +1136,9 @@ def training_step(
             # Apply update
             if hparams.is_post_training:
                 if p_name in [
-                    "transformer.w_q_gate",
-                    "transformer.w_k_routing",
-                    "transformer.q_bias",
+                    "transformerw_q_gate",
+                    "transformerw_k_routing",
+                    "transformerq_bias",
                 ]:
                     new_ps.append(p - g)
                 else:  # other weights are frozen

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import os
 import fsspec
 import zarr
+import json
 from numcodecs import blosc
 from clearml import Logger
 import numpy as np
@@ -52,6 +53,7 @@ def log(
     metrics: PyTree,
     stats_dict: PyTree = None,
     prefix: str = "",
+    output_file: str = "out",
 ):
     """Logs the output of a training step. The output must be a PyTree of f32 arrays."""
 
@@ -63,8 +65,8 @@ def log(
             if path not in path_map:
                 path_map[path] = (path, path)
             title, series = path_map[path]
-            title = f"{prefix}{title}" if prefix else title
-            series = f"{prefix}{series}" if prefix else series
+            title = f"{prefix}_{title}" if prefix else title
+            series = f"{prefix}_{series}" if prefix else series
             arr = jax.device_get(arr)
 
             if arr.shape == () and arr.dtype == jnp.float32:
@@ -130,7 +132,8 @@ def log(
 
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if not logger:
-            print(f"[{now}] Step {step}: {metrics_dict}")
+            print(f"[{now}] Step {step}: ")
+            print(json.dumps(metrics_dict, indent=4), file=open(output_file, "w"))
 
 
 def log_eval_stats(step: int, logger: Logger, stats_dict: PyTree):

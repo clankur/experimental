@@ -431,7 +431,7 @@ class Model:
             dtype=jnp.float32,
         )
 
-        q_bias = jnp.ones(w_q_gate_shape[:-1], dtype=jnp.float32)
+        q_bias = jnp.ones(w_q_gate_shape[:-1], dtype=jnp.float32) * 10.0
         arrays = Model(
             embed=embed,
             unembed=unembed,
@@ -560,9 +560,11 @@ class Model:
             stats["logits"] = get_stats(logits)
             raw_logits = jnp.where(causal_mask, logits, -1e10)
             raw_probs = jnp.bfloat16(quiet_softmax(raw_logits))
-            total_raw_probs = jax.lax.stop_gradient(
-                einops.reduce(raw_probs, "B Qlen Klen Q K -> B Qlen Q K", "sum")
+            stats["raw_probs"] = get_stats(raw_probs)
+            total_raw_probs = einops.reduce(
+                raw_probs, "B Qlen Klen Q K -> B Qlen Q K", "sum"
             )
+            stats["total_raw_probs"] = get_stats(total_raw_probs)
             # Partition routing
             w_q_gate = shardops.all_gather(
                 "n_partitions Q K/t M/d -> n_partitions Q K/t M",
@@ -574,15 +576,17 @@ class Model:
             # query gate identifies a partition of the keys it wants
             q_gate = shardops.einsum_unreduced(
                 "B/d L M, n_partitions Q K/t M -> B/d L Q K/t n_partitions",
-                jax.lax.stop_gradient(gx),
+                (gx),
                 w_q_gate,
             )
             # key routing routes the each key to aspecific partition
             k_route = shardops.einsum_unreduced(
                 "B/d L M, n_partitions K/t M -> B/d L K/t n_partitions",
-                jax.lax.stop_gradient(gx),
+                (gx),
                 w_k_routing,
             )
+            stats["q_gate"] = get_stats(q_gate)
+            stats["k_route"] = get_stats(k_route)
             # TODO: add biases to q
             # temp = 0.01 + 20 * (jnp.float32(step) / jnp.float32(total_steps))
             # sigmoid (q_gate + bias) # want them to select all the keys => pretty close to 1 at first
@@ -592,8 +596,13 @@ class Model:
             q_bias = einops.rearrange(
                 layer_weights.q_bias, "n_partitions Q K -> Q K n_partitions"
             )
+            q_gate = q_gate + q_bias
+            stats["q_bias"] = get_stats(q_bias)
+            stats["q_gate_bias"] = get_stats(q_gate)
             q_gate = jax.nn.sigmoid(q_gate)
+            stats["q_gate_sigmoid"] = get_stats(q_gate)
             k_route = jax.nn.softmax(k_route, axis=-1)
+            stats["k_route_softmax"] = get_stats(k_route)
             softmask = shardops.einsum_unreduced(
                 "B/d Qlen Q K/t n_partitions, B/d Klen K/t n_partitions -> B/d Qlen Klen Q K/t",
                 q_gate,
@@ -604,15 +613,16 @@ class Model:
             # apply softmask
             apply_softmask = step >= h.softmask_start_fraction * total_steps
             apply_hardmask = step >= h.hardmask_start_fraction * total_steps
-            softmask_logits = jax.lax.stop_gradient(logits) + jnp.log(
+            softmask_logits = (logits) + jnp.log(
                 softmask + 1e-6
             )  # TODO: review this line
             softmask_logits = jnp.where(
                 (causal_mask * softmask) != 0, softmask_logits, -1e10
             )
             softmask_probs = jnp.bfloat16(quiet_softmax(softmask_logits))
+            stats["softmask_probs"] = get_stats(softmask_probs)
             cluster_recall = einops.reduce(
-                jax.lax.stop_gradient(raw_probs) * softmask,
+                (raw_probs) * softmask,
                 "B Qlen Klen Q K -> B Qlen Q K",
                 "sum",
             )  # how much of the total probability we recall after masking
@@ -624,7 +634,6 @@ class Model:
             )  # approximating the number of keys retrieved
             stats["cluster_recall"] = get_stats(cluster_recall)
             stats["relative_cluster_recall"] = get_stats(relative_cluster_recall)
-            stats["log_cluster_recall"] = get_stats(jnp.log(cluster_recall + 1e-6))
             probs = jax.lax.select(
                 apply_softmask, jnp.bfloat16(softmask_probs), raw_probs
             )
@@ -779,8 +788,11 @@ class Model:
         logprobs_at_targets = shardops.psum_scatter(
             "batch/d len -> batch/d len/t", logprobs_at_targets
         )
-        tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
+        tokens_in_global_batch = logprobs_at_targets.size * lax.psum(1, ("d", "t"))
         ce_loss = -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
+        recall_loss = -jnp.log(
+            stats_dict["cluster_recall"].mean / stats_dict["total_raw_probs"].mean
+        )
         retrieve_loss = 0.0
         for layer in range(1, h.layers):  # skip first layer based on patterns
             soft_retrieved = stats_dict[f"{layer}.soft_retrieved_percent"].mean
@@ -792,7 +804,7 @@ class Model:
             )
 
         retrieve_loss = retrieve_loss / (h.layers - 1)
-        total_loss = ce_loss + retrieve_loss
+        total_loss = ce_loss + retrieve_loss + recall_loss
         return (
             total_loss,
             (ce_loss, stats_dict),
@@ -930,6 +942,7 @@ class TrainingHparams:
     use_single_worker: Optional[bool] = False
     use_multistage_training: Optional[bool] = False
     is_post_training: Optional[bool] = False  # Flag to indicate post-training phase
+    post_training_mult: float = 1.0
 
 
 @pytree_dataclass
@@ -1012,33 +1025,6 @@ def training_step(
         # So we reduce the loss across chips _outside_ the autodiff.
 
         # If in post-training phase, zero out gradients for non-partitioning parameters
-        if hparams.is_post_training:
-            # Create a new transformer with zeroed gradients
-            zeroed_transformer = Transformer(
-                ln1=jnp.zeros_like(grad.transformer.ln1),
-                ln2=jnp.zeros_like(grad.transformer.ln2),
-                w_q=jnp.zeros_like(grad.transformer.w_q),
-                w_kv=jnp.zeros_like(grad.transformer.w_kv),
-                w_o=jnp.zeros_like(grad.transformer.w_o),
-                w_gate=jnp.zeros_like(grad.transformer.w_gate),
-                w_up=jnp.zeros_like(grad.transformer.w_up),
-                w_down=jnp.zeros_like(grad.transformer.w_down),
-                # Keep the partitioning parameters' gradients
-                w_q_gate=grad.transformer.w_q_gate,
-                w_k_routing=grad.transformer.w_k_routing,
-                q_bias=grad.transformer.q_bias,
-            )
-
-            # Replace the transformer gradients
-            grad = replace(grad, transformer=zeroed_transformer)
-
-            # Zero out embedding and unembedding gradients
-            grad = replace(
-                grad,
-                embed=jnp.zeros_like(grad.embed),
-                unembed=jnp.zeros_like(grad.unembed),
-                final_layer_norm=jnp.zeros_like(grad.final_layer_norm),
-            )
 
         loss = jax.lax.psum(loss, ("d", "t"))
         ce_loss = jax.lax.psum(ce_loss, ("d", "t"))
@@ -1118,8 +1104,14 @@ def training_step(
         new_ps = []
         new_mus = []
         new_nus = []
-        for p, g, mu, nu, spec, lr_scale in zip(
-            tree_leaves(state.weights),
+        paths_and_values, _ = jax.tree_util.tree_flatten_with_path(state.weights)
+        parameter_names, parameters = zip(
+            *[(jax.tree_util.keystr(path), value) for path, value in paths_and_values]
+        )
+
+        for p_name, p, g, mu, nu, spec, lr_scale in zip(
+            parameter_names,
+            parameters,
             grad_leaves,
             tree_leaves(state.adam_mu),
             tree_leaves(state.adam_nu),
@@ -1146,7 +1138,17 @@ def training_step(
             g *= lr * lr_scale
 
             # Apply update
-            new_ps.append(p - g)
+            if hparams.is_post_training:
+                if p_name in [
+                    "transformerw_q_gate",
+                    "transformerw_k_routing",
+                    "transformerq_bias",
+                ]:
+                    new_ps.append(p - g)
+                else:  # other weights are frozen
+                    new_ps.append(p)
+            else:
+                new_ps.append(p - g)
             new_mus.append(mu)
             new_nus.append(nu)
 
@@ -1266,7 +1268,8 @@ def main_contained(config, logger):
         post_train_config = replace(
             config.training,
             is_post_training=True,  # Set the flag for post-training
-            learning_rate=config.training.learning_rate,
+            learning_rate=config.training.learning_rate
+            * config.training.post_training_mult,
             warmup_steps=config.training.warmup_steps // 30,
             steps=config.training.steps // 3,
             seed=config.training.seed + 10,

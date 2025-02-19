@@ -36,6 +36,8 @@ model:
   vocab: 50304
   
   rope_max_timescale: 10000
+  apply_alibi: true
+  apply_rope: false
 
   parameterization: "sp"
   fully_aligned: false

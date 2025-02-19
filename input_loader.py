@@ -527,17 +527,32 @@ class LongCrawl64Dataloader:
         self.num_hosts = jax.process_count()
         self.host_index = jax.process_index()
 
+        # Generate shuffled indices for documents
+        self.row_chunks = self.doc_count // self.docs_per_batch
+        self.doc_permutation = _random_permutation(config.seed, self.row_chunks)
+        # Generate shuffled indices for context windows
+        self.context_chunks = self.doc_length // self.context_size
+        self.context_permutation = _random_permutation(
+            config.seed + 1, self.context_chunks
+        )
+
     def __len__(self):
         return self.dataset_tokens // (self.tokens_per_batch * self.num_hosts)
 
     def __getitem__(self, index):
         # Identify corner of the rectangle
         index = index + self.host_index * len(self)
-        row_chunks = self.doc_count // self.docs_per_batch
+        row_chunks = self.row_chunks
         context_idx = index // row_chunks
-        context_physical = context_idx * self.context_size
         document_idx = index % row_chunks
-        document_physical = document_idx * self.docs_per_batch
+
+        # Apply permutations to get shuffled indices
+        shuffled_context_idx = self.context_permutation[context_idx]
+        shuffled_document_idx = self.doc_permutation[document_idx]
+
+        # Convert to physical positions
+        context_physical = shuffled_context_idx * self.context_size
+        document_physical = shuffled_document_idx * self.docs_per_batch
 
         # Slice the rectangle
         data = self.dataset[

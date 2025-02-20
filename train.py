@@ -103,6 +103,7 @@ class Hparams:
     hardmask_start_fraction: float = 1.0
     hard_q_threshold: float = 0.5
     retrieve_budget: float = 0.5
+    initial_q_bias: float = 20.0
 
 
 @pytree_dataclass
@@ -432,7 +433,7 @@ class Model:
             dtype=jnp.float32,
         )
 
-        q_bias = jnp.ones(w_q_gate_shape[:-1], dtype=jnp.float32) * 10.0
+        q_bias = jnp.ones(w_q_gate_shape[:-1], dtype=jnp.float32) * h.initial_q_bias
         arrays = Model(
             embed=embed,
             unembed=unembed,

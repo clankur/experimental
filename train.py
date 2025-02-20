@@ -548,25 +548,12 @@ class Model:
             if h.apply_alibi:
                 logits = alibi.apply(logits)
 
-            # TODO: emit min of the max(query-key alignments)
-            max_qk_alignment = einops.reduce(
-                logits, "B Qlen Klen Q K -> B Qlen Q K", "max"
-            )
-            stats["max_qk_alignment"] = get_stats(max_qk_alignment)
-            min_max_qk_alignment = einops.reduce(
-                max_qk_alignment,
-                "B Qlen Q K -> B Q K",
-                "min",
-            )
-            stats["min_max_qk_alignment"] = get_stats(min_max_qk_alignment)
-            stats["logits"] = get_stats(logits)
             raw_logits = jnp.where(causal_mask, logits, -1e10)
             raw_probs = jnp.bfloat16(quiet_softmax(raw_logits))
-            stats["raw_probs"] = get_stats(raw_probs)
             total_raw_probs = einops.reduce(
                 raw_probs, "B Qlen Klen Q K -> B Qlen Q K", "sum"
             )
-            stats["total_raw_probs"] = get_stats(total_raw_probs)
+            stats["total_raw_probs"] = get_stats(jnp.float32(total_raw_probs))
             # Partition routing
             w_q_gate = shardops.all_gather(
                 "n_partitions Q K/t M/d -> n_partitions Q K/t M",
@@ -587,30 +574,17 @@ class Model:
                 (gx),
                 w_k_routing,
             )
-            stats["q_gate"] = get_stats(q_gate)
-            stats["k_route"] = get_stats(k_route)
-            # TODO: add biases to q
-            # temp = 0.01 + 20 * (jnp.float32(step) / jnp.float32(total_steps))
-            # sigmoid (q_gate + bias) # want them to select all the keys => pretty close to 1 at first
-            # bias = vector * scale
-            # METRIC: track bias decay over time
-            # idea: since clusters are decaying over time, we can also decay it manually as a function of step
             q_bias = einops.rearrange(
                 layer_weights.q_bias, "n_partitions Q K -> Q K n_partitions"
             )
             q_gate = q_gate + q_bias
-            stats["q_bias"] = get_stats(q_bias)
-            stats["q_gate_bias"] = get_stats(q_gate)
             q_gate = jax.nn.sigmoid(q_gate)
-            stats["q_gate_sigmoid"] = get_stats(q_gate)
             k_route = jax.nn.softmax(k_route, axis=-1)
-            stats["k_route_softmax"] = get_stats(k_route)
             softmask = shardops.einsum_unreduced(
                 "B/d Qlen Q K/t n_partitions, B/d Klen K/t n_partitions -> B/d Qlen Klen Q K/t",
                 q_gate,
                 k_route,
             )
-            stats["softmask"] = get_stats(softmask * causal_mask)
 
             # apply softmask
             apply_softmask = step >= h.softmask_start_fraction * total_steps
@@ -622,7 +596,6 @@ class Model:
                 (causal_mask * softmask) != 0, softmask_logits, -1e10
             )
             softmask_probs = jnp.bfloat16(quiet_softmax(softmask_logits))
-            stats["softmask_probs"] = get_stats(softmask_probs)
             cluster_recall = einops.reduce(
                 (raw_probs) * softmask,
                 "B Qlen Klen Q K -> B Qlen Q K",
@@ -635,7 +608,6 @@ class Model:
                 softmask * causal_mask, "B Qlen Klen Q K -> B Qlen Q K", "sum"
             )  # approximating the number of keys retrieved
             stats["cluster_recall"] = get_stats(cluster_recall)
-            stats["relative_cluster_recall"] = get_stats(relative_cluster_recall)
             probs = jax.lax.select(
                 apply_softmask, jnp.bfloat16(softmask_probs), raw_probs
             )
@@ -659,18 +631,6 @@ class Model:
             hardmask_logits = jnp.where(causal_mask * hardmask, logits, -1e10)
             hardmask_probs = jnp.bfloat16(quiet_softmax(hardmask_logits))
             probs = jax.lax.select(apply_hardmask, hardmask_probs, probs)
-            hard_cluster_recall = einops.reduce(
-                hardmask_probs, "B Qlen Klen Q K -> B Qlen Q K", "sum"
-            )
-            stats["hard_cluster_recall"] = get_stats(hard_cluster_recall)
-            retrieved_percent = jnp.sum(hardmask * causal_mask, axis=2) / jnp.sum(
-                causal_mask, axis=2
-            )
-            stats["retrieved_percent"] = get_stats(retrieved_percent)
-            # maybe we want a loss based on prob per token loaded, total_prob/total_tokens_loaded, if below threshold drop it
-            # to raise precision?
-            # to get total retrieved, get a one hot coding based on threhold, sum along a cluster index, divide by sum along causal mask's key axis
-
             attn_out = shardops.einsum_unreduced(
                 "B/d Qlen Klen Q K/t, B/d Klen K/t D -> B/d Qlen Q K/t D", probs, v
             )

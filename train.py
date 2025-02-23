@@ -98,6 +98,14 @@ class Hparams:
     apply_rope: Optional[bool] = True
     apply_alibi: Optional[bool] = False
 
+    # attention temperature parameters
+    attn_temp: float = 1.0  # Base attention temperature
+    scale_attn_temp: bool = False  # Whether to scale temperature during training
+    attn_temp_min: float = 1.0  # Minimum temperature to scale to
+    attn_temp_warmup_steps: int = (
+        0  # Steps to warm up temperature scaling, 0 means use training warmup
+    )
+
 
 def get_parameterization(style: str, fully_aligned: bool = True):
     Parameterization = namedtuple(
@@ -341,7 +349,11 @@ class Model:
 
     @typechecked
     def forward_pass(
-        self, h: Hparams, ids: u32[b"B/d L"], is_seq_start: bool_[b"B/d L"]
+        self,
+        h: Hparams,
+        ids: u32[b"B/d L"],
+        is_seq_start: bool_[b"B/d L"],
+        attn_temp: f32[b""],
     ) -> f32[b"B/d L V/t"]:
         p = get_parameterization(h.parameterization)
         embed_mult = (h.d_model / h.base.d_model) ** -p.embed_param_mult
@@ -424,7 +436,7 @@ class Model:
             if h.apply_alibi:
                 logits = alibi.apply(logits)
             logits = jnp.where(causal_mask, logits, -1e10)
-            probs = jnp.bfloat16(quiet_softmax(logits))
+            probs = jnp.bfloat16(quiet_softmax(logits) * attn_temp)
             attn_out = shardops.einsum_unreduced(
                 "B/d Qlen Klen Q K/t, B/d Klen K/t D -> B/d Qlen Q K/t D", probs, v
             )
@@ -491,7 +503,7 @@ class Model:
         return logits
 
     @typechecked
-    def loss(self, h: Hparams, batch: TokenBatch) -> f32[b""]:
+    def loss(self, h: Hparams, batch: TokenBatch, attn_temp: f32[b""]) -> f32[b""]:
         # Given sequence-packed targets:
         #   [[1, 2], [3, 4, 5], [6, 7, 8, 9]]
         # we want inputs:
@@ -502,7 +514,9 @@ class Model:
         is_seq_start: bool_[b"batch/d len"] = batch.is_seq_start
         inputs: u32[b"batch/d len"] = jnp.where(is_seq_start, 0, inputs)
 
-        logits: f32[b"batch/d len V/t"] = self.forward_pass(h, inputs, is_seq_start)
+        logits: f32[b"batch/d len V/t"] = self.forward_pass(
+            h, inputs, is_seq_start, attn_temp
+        )
         max_logits: f32[b"batch/d len 1"] = lax.pmax(
             jnp.max(lax.stop_gradient(logits), axis=-1, keepdims=True), "t"
         )
@@ -604,6 +618,7 @@ class Metrics:
     learning_rate: f32[b""]
     grad_norm: f32[b""]
     raw_grad_norm: f32[b""]
+    attn_temp: f32[b""]  # Current attention temperature
 
 
 @dataclass(frozen=True)
@@ -647,9 +662,9 @@ class State:
 def eval_model(state: State, h: Hparams, batch: TokenBatch) -> f32[b""]:
     @partial(shardtypes.typed_shard_map, check_rep=False)
     def eval_model_shard(state: State, batch: TokenBatch) -> f32[b""]:
-        loss, _ = jax.value_and_grad(lambda weights: weights.loss(h, batch))(
-            state.weights
-        )
+        loss, _ = jax.value_and_grad(
+            lambda weights: weights.loss(h, batch, jnp.float32(h.attn_temp))
+        )(state.weights)
         loss = jax.lax.psum(loss, ("d", "t"))
         return loss
 
@@ -671,9 +686,21 @@ def training_step(
     def sharded_step(
         state: State, step: u32[b""], batch: TokenBatch
     ) -> Tuple[State, Metrics]:
-        loss, grad = jax.value_and_grad(lambda weights: weights.loss(h, batch))(
-            state.weights
-        )
+        # Calculate current attention temperature
+        attn_temp = 1.0  # Start from 1.0
+        if h.scale_attn_temp:
+            warmup_steps = (
+                h.attn_temp_warmup_steps
+                if h.attn_temp_warmup_steps > 0
+                else h.warmup_steps
+            )
+            scale = jnp.minimum(1.0, jnp.float32(step) / warmup_steps)
+            attn_temp = h.attn_temp_min + (h.attn_temp - h.attn_temp_min) * scale
+        attn_temp = jnp.float32(attn_temp)
+
+        loss, grad = jax.value_and_grad(
+            lambda weights: weights.loss(h, batch, attn_temp)
+        )(state.weights)
         # Gradients have already been reduced across chips because the gradient of the weight `all_gather`
         # is weight-gradient `psum_scatter`. Loss, on the other hand, hasn't been reduced across chips: if we
         # did that inside the autodiff, we'd be double-reducing the loss, effectively multiplying it by the
@@ -791,6 +818,7 @@ def training_step(
             learning_rate=lr,
             grad_norm=global_norm * rescale,
             raw_grad_norm=global_norm,
+            attn_temp=attn_temp,
         )
         return new_state, metrics
 
@@ -900,6 +928,7 @@ def main_contained(config, logger):
             cum_metrics.grad_norm += metrics.grad_norm
             cum_metrics.raw_grad_norm += metrics.raw_grad_norm
             cum_metrics.learning_rate += metrics.learning_rate
+            cum_metrics.attn_temp += metrics.attn_temp
 
         start_time = time.time()
 
@@ -971,6 +1000,7 @@ def main_contained(config, logger):
                         learning_rate=cum_metrics.learning_rate / log_interval,
                         grad_norm=cum_metrics.grad_norm / log_interval,
                         raw_grad_norm=cum_metrics.raw_grad_norm / log_interval,
+                        attn_temp=cum_metrics.attn_temp / log_interval,
                     )
                 else:
                     cum_metrics = output

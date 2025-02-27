@@ -297,10 +297,10 @@ if df_to_run.empty:
     print("No new configurations to run!")
 
 print(f"\nFound {len(df_to_run)} configurations to run")
-
 experiments_to_run = deque([])
 for idx, row in df_to_run.iterrows():
     print(f"\nRunning configuration {idx + 1}/{len(df_to_run)}")
+    # TODO: Only run trainings for those with the current branch name
     clearml_id = run_training(row, df, idx)
     if clearml_id:
         experiments_to_run.append(clearml_id)

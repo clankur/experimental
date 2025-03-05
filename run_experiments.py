@@ -16,9 +16,16 @@ pd.set_option("display.width", None)
 pd.set_option("display.max_colwidth", None)
 
 avg_time_per_experiment = 30  # minutes
-
+SHOW_BASE_PARAMS = False
 
 # %%
+BASE_MAPPINGS = {
+    "base_d_model": ("d_model", "model.base"),
+    "base_n_q_per_kv": ("n_q_per_kv", "model.base"),
+    "base_n_kv": ("n_kv", "model.base"),
+    "base_d_head": ("d_head", "model.base"),
+    "base_d_ff": ("d_ff", "model.base"),
+}
 PARAM_MAPPINGS = {
     # Basic parameters
     "config_name": ("--config-name", None),
@@ -41,7 +48,27 @@ PARAM_MAPPINGS = {
     "gamma_embed": ("gamma_embed", "model"),
     "gamma_hidden": ("gamma_hidden", "model"),
     "gamma_unembed": ("gamma_unembed", "model"),
-    # TODO: Missing base parameters
+    # Training parameters
+    "warmup_steps": ("warmup_steps", "training"),
+    "steps": ("steps", "training"),
+    "steps_for_lr": ("steps_for_lr", "training"),
+    "learning_rate": ("learning_rate", "training"),
+    "batch_size": ("tokens.batch", "training"),
+    "use_grad_clip": ("use_grad_clip", "training"),
+    "use_gpu": ("use_gpu", "training"),
+    "use_single_worker": ("use_single_worker", "training"),
+    "n_log_iterations": ("n_log_iterations", "training"),
+    "post_training_mult": ("post_training_mult", "training"),
+    "adam_b1": ("adam_b1", "training"),
+    "adam_b2": ("adam_b2", "training"),
+    "adam_eps": ("adam_eps", "training"),
+    "adam_eps_root": ("adam_eps_root", "training"),
+    "weight_decay": ("weight_decay", "training"),
+    "cosine_lr_final_fraction": ("cosine_learning_rate_final_fraction", "training"),
+    "training_seed": ("seed", "training"),
+    # IO parameters
+    "max_io_threads": ("max_io_threads", "io"),
+    # partition routing parameters
     "n_partitions": ("n_partitions", "model"),
     "apply_alibi": ("apply_alibi", "model"),
     "apply_rope": ("apply_rope", "model"),
@@ -50,25 +77,15 @@ PARAM_MAPPINGS = {
     "hard_q_threshold": ("hard_q_threshold", "model"),
     "retrieve_budget": ("retrieve_budget", "model"),
     "initial_q_bias": ("initial_q_bias", "model"),
-    # Training parameters
-    "queue": ("queue", "training"),
-    "warmup_steps": ("warmup_steps", "training"),
-    "steps": ("steps", "training"),
-    "steps_for_lr": ("steps_for_lr", "training"),
-    "learning_rate": ("learning_rate", "training"),
-    "batch_tokens": ("tokens.batch", "training"),
-    "use_grad_clip": ("use_grad_clip", "training"),
-    "use_gpu": ("use_gpu", "training"),
-    "use_single_worker": ("use_single_worker", "training"),
-    "n_log_iterations": ("n_log_iterations", "training"),
-    "post_training_mult": ("post_training_mult", "training"),
 }
+if SHOW_BASE_PARAMS:
+    PARAM_MAPPINGS.update(BASE_MAPPINGS)
 
 
 # %%
 def load_yaml_config(config_name):
     """
-    Load the YAML config file for the given config name
+    Load the YAML config file for the given config name, including any defaults
     """
     config_path = Path("configs") / f"{config_name}.yaml"
     if not config_path.exists():
@@ -77,7 +94,58 @@ def load_yaml_config(config_name):
 
     with open(config_path) as f:
         config = yaml.safe_load(f)
+
+    # Handle defaults section if it exists
+    if "defaults" in config:
+        merged_config = {}
+
+        # Process each default config
+        for default in config["defaults"]:
+            if default == "_self_":
+                continue  # '_self_' is just a placeholder for current config
+
+            if isinstance(default, str):
+                pkg_path = Path("configs") / f"{default}.yaml"
+                # Load and merge default config
+                default_config = load_yaml_config(default)
+                merged_config = deep_merge_configs(merged_config, default_config)
+            elif isinstance(default, dict):
+                # Handle package defaults like {pkg: config}
+
+                for pkg, pkg_config in default.items():
+
+                    pkg_path = Path("configs") / pkg / f"{pkg_config}.yaml"
+                    if pkg_path.exists():
+                        with open(pkg_path) as f:
+                            pkg_default_config = yaml.safe_load(f)
+                            merged_config = deep_merge_configs(
+                                merged_config, pkg_default_config
+                            )
+
+        # Remove the defaults section to avoid processing it again
+        config.pop("defaults")
+
+        # Current config overrides defaults
+        merged_config = deep_merge_configs(merged_config, config)
+        return merged_config
+
     return config
+
+
+def deep_merge_configs(base, override):
+    """
+    Deep merge two dictionaries, with override values taking precedence
+    """
+    result = base.copy()
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            # If both are dictionaries, merge them recursively
+            result[key] = deep_merge_configs(result[key], value)
+        else:
+            # Otherwise override
+            result[key] = value
+
+    return result
 
 
 def get_override_value(prefix, value, sub_param=None, param_in_config=False):
@@ -277,7 +345,7 @@ def update_with_config_values(df):
 # %%
 
 # Read the CSV file
-csv_path = Path("model_configs.csv")
+csv_path = Path("experiment_configs.csv")
 if not csv_path.exists():
     print(f"Error: {csv_path} not found!")
     sys.exit(1)

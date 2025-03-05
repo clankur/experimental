@@ -48,11 +48,26 @@ model:
   zero_queries: true
   zero_unembed: true
 
+  window_size: 128
+  n_kv_caches: 4
+  reuse_kv_map:
+    - [0, 0]
+    - [1, 0]
+    - [2, 1]
+    - [3, 1]
+    - [4, 2]
+    - [5, 3]
+    - [6, 3]
+    - [7, 2]
+  sa_layers:
+    - 4
+    - 7
+
 longcrawl:
   path: "/home/clankur/data"
 
 paths:
-    root_working_dir: "gs://c4_v4-32_31m"
+  root_working_dir: "gs://c4_v4-32_31m"
 
 checkpoint_interval: 700 
 

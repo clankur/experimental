@@ -222,13 +222,15 @@ def get_parameterization(style: str, fully_aligned: bool = True):
 class TransformerLayer:
     ln1: f32["d_model/t/d"]
     ln2: f32["d_model/t/d"]
-    ln_compressed: f32["d_compressed/t/d"]
+    ln_k: f32["d_compressed/t/d"]
+    ln_v: f32["d_compressed/t/d"]
     w_q_pe: f32["d_model/d n_h/t d_head_half"]
     w_q_nope: f32["d_model/d n_h/t d_head_half"]
     w_k_pe: f32["d_model/d/t d_head_half"]
     w_k_compressed: f32["d_model/d/t d_compressed"]
     w_k_nope: f32["d_compressed/d n_h/t d_head_half"]
-    w_v: f32["d_model/d n_h/t d_head"]
+    w_v: f32["d_compressed/d n_h/t d_head"]
+    w_v_compressed: f32["d_model/d/t d_compressed"]
     w_o: f32["d_model/d n_h/t d_head"]
     w_gate: f32["d_model/d d_ff/t"]
     w_up: f32["d_model/d d_ff/t"]
@@ -364,11 +366,20 @@ class Model:
             fold_in_str(rng, "w_v"),
             -2,
             2,
-            (h.layers, h.d_model, h.n_h, h.d_head),
+            (h.layers, h.d_compressed, h.n_h, h.d_head),
             dtype=jnp.float32,
         )
 
-        ln_compressed = jnp.ones((h.layers, h.d_compressed), dtype=jnp.float32)
+        w_v_compressed = w_kv_scale * jax.random.truncated_normal(
+            fold_in_str(rng, "w_v_compressed"),
+            -2,
+            2,
+            w_k_compressed_shape,
+            dtype=jnp.float32,
+        )
+
+        ln_k = jnp.ones((h.layers, h.d_compressed), dtype=jnp.float32)
+        ln_v = jnp.ones((h.layers, h.d_compressed), dtype=jnp.float32)
 
         arrays = Model(
             embed=embed,
@@ -376,13 +387,15 @@ class Model:
             transformer=Transformer(
                 ln1=ln1,
                 ln2=ln2,
-                ln_compressed=ln_compressed,
+                ln_k=ln_k,
+                ln_v=ln_v,
                 w_q_pe=w_q_pe,
                 w_q_nope=w_q_nope,
                 w_k_pe=w_k_pe,
                 w_k_compressed=w_k_compressed,
                 w_k_nope=w_k_nope,
                 w_v=w_v,
+                w_v_compressed=w_v_compressed,
                 w_o=w_o,
                 w_gate=w_gate,
                 w_up=w_up,
@@ -463,7 +476,7 @@ class Model:
             )
 
             q = jnp.concatenate([q_pe, q_nope], axis=-1)
- 
+
             w_k_compressed = shardops.all_gather(
                 "M/d/t C -> M C", jnp.bfloat16(layer_weights.w_k_compressed)
             )
@@ -472,10 +485,8 @@ class Model:
             )
             k_compressed = save_for_backward(k_compressed)
 
-            ln_compressed = shardops.all_gather(
-                "C/t/d -> C", jnp.float32(layer_weights.ln_compressed)
-            )
-            n_k_compressed = jnp.bfloat16(rms_norm(k_compressed) * ln_compressed)
+            ln_k = shardops.all_gather("C/t/d -> C", jnp.float32(layer_weights.ln_k))
+            n_k_compressed = jnp.bfloat16(rms_norm(k_compressed) * ln_k)
 
             w_k_nope = shardops.all_gather(
                 "C/d H/t half_D -> C H/t half_D", jnp.bfloat16(layer_weights.w_k_nope)
@@ -499,11 +510,22 @@ class Model:
 
             k = jnp.concatenate([k_pe, k_nope], axis=-1)
 
+            w_v_compressed = shardops.all_gather(
+                "M/d/t C -> M C", jnp.bfloat16(layer_weights.w_v_compressed)
+            )
+            v_compressed = hidden_mult * shardops.einsum_unreduced(
+                "B/d L M, M C -> B/d L C", nx, w_v_compressed
+            )
+            v_compressed = save_for_backward(v_compressed)
+
+            ln_v = shardops.all_gather("C/t/d -> C", jnp.float32(layer_weights.ln_v))
+            n_v_compressed = jnp.bfloat16(rms_norm(v_compressed) * ln_v)
+
             w_v = shardops.all_gather(
-                "M/d K/t D -> M K/t D", jnp.bfloat16(layer_weights.w_v)
+                "C/d H/t D -> C H/t D", jnp.bfloat16(layer_weights.w_v)
             )
             v = hidden_mult * shardops.einsum_unreduced(
-                "B/d L M, M H/t D -> B/d L H/t D", nx, w_v
+                "B/d L C, C H/t D -> B/d L H/t D", n_v_compressed, w_v
             )
             v = save_for_backward(v)
 
@@ -783,7 +805,8 @@ def training_step(
             transformer=Transformer(
                 ln1=1.0,
                 ln2=1.0,
-                ln_compressed=1.0,
+                ln_k=1.0,
+                ln_v=1.0,
                 w_q_pe=h.gamma_hidden * (h.d_model / base.d_model) ** -p.hidden_lr,
                 w_q_nope=h.gamma_hidden * (h.d_model / base.d_model) ** -p.hidden_lr,
                 w_k_pe=h.gamma_hidden * (h.d_model / base.d_model) ** -p.hidden_lr,
@@ -792,6 +815,8 @@ def training_step(
                 w_k_nope=h.gamma_hidden
                 * (h.d_compressed / base.d_compressed) ** -p.hidden_lr,
                 w_v=h.gamma_hidden * (h.d_model / base.d_model) ** -p.hidden_lr,
+                w_v_compressed=h.gamma_hidden
+                * (h.d_model / base.d_model) ** -p.hidden_lr,
                 w_o=h.gamma_hidden * (target_head_dim / base_head_dim) ** -p.hidden_lr,
                 w_gate=h.gamma_hidden * (h.d_model / base.d_model) ** -p.hidden_lr,
                 w_up=h.gamma_hidden * (h.d_model / base.d_model) ** -p.hidden_lr,

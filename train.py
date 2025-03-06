@@ -437,6 +437,8 @@ class Model:
             gx = shardops.all_gather("B/d L M/t -> B/d L M", x)
             nx = jnp.bfloat16(rms_norm(gx) * ln1)
 
+            # TODO: compress, layer norm, uncompress q
+
             # Split query into PE and non-PE components
             w_q_pe = shardops.all_gather(
                 "M/d H/t half_D -> M H/t half_D", jnp.bfloat16(layer_weights.w_q_pe)
@@ -461,7 +463,7 @@ class Model:
             )
 
             q = jnp.concatenate([q_pe, q_nope], axis=-1)
-
+ 
             w_k_compressed = shardops.all_gather(
                 "M/d/t C -> M C", jnp.bfloat16(layer_weights.w_k_compressed)
             )

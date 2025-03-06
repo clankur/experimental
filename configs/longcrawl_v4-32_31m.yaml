@@ -20,15 +20,15 @@ training:
 
 model:
   d_model: 256 
-  n_q_per_kv: 1
-  n_kv: 16 
+  n_h: 16 
+  d_compressed: 64
   d_head: 64 
   d_ff: 1024 
 
   base:
     d_model: 256 
-    n_q_per_kv: 1
-    n_kv: 16 
+    n_h: 16 
+    d_compressed: 64
     d_head: 64
     d_ff: 1024 
 

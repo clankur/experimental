@@ -1,10 +1,10 @@
-# mugpt
+# experimental
 
-mugpt is a fork of [seqax by MatX](https://github.com/MatX-inc/seqax) modified to run on Google's TPU v4-32s and uses the hyperparameter transfer described by [Everett et al.](https://arxiv.org/pdf/2407.05872v2) Previously, I experimented with a modified form of attention "SharedKV" which resides in the [sharedkv branch](https://github.com/clankur/mugpt/tree/shared_kv) as well as mu-parameter transfer described by [Yang et al.](https://arxiv.org/pdf/2203.03466) For more information on these investigations, take a look here:
+My repo with all the various attention tweaks I have made for reducing the KV Cache's footprint. This is a fork of [seqax by MatX](https://github.com/MatX-inc/seqax) modified to run on Google's TPU v4-32s and uses the hyperparameter transfer described by [Everett et al.](https://arxiv.org/pdf/2407.05872v2). My noteable experiments include:
 
-- [Benchmarking Learning Rate Transfer](./docs/exp_scaling.md)
-- [Minimizing HBM usage through SharedKV](./docs/sharedkv.md)
-- [Exploring the best approaches for implementing muP](./docs/mup.md)
+- [Building a independent K partitions selectively accessed by different Qs](https://github.com/clankur/experimental/tree/parition_qk_alibi_embed)
+- [A post training implementation of building the independent K partitions](https://github.com/clankur/experimental/tree/parition_qk_alibi_embed_post_training)
+- [Clustering QK](https://github.com/clankur/experimental/tree/cluster_qk)
 
 The installation procedure is identical to that described in [seqax](https://github.com/MatX-inc/seqax).
 
